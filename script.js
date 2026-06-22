@@ -1412,10 +1412,37 @@ function ParseSongRequest(text) {
 	return { title: text.trim(), artist: '' };
 }
 
-async function SpotifyTitleFromUrl(url) {
+async function SpotifyInfoFromUrl(url) {
 	const resp = await fetch('https://open.spotify.com/oembed?url=' + encodeURIComponent(url));
-	if (!resp.ok) return '';
-	return (await resp.json()).title || '';
+	if (!resp.ok) return null;
+	const j = await resp.json();
+	return { title: j.title || '', thumbnail: j.thumbnail_url || '' };
+}
+
+// Resolve true only if the image URL actually loads (catches dead Cover Art Archive
+// links, 404s, etc.). Times out so a slow source can't stall the card forever.
+function ImageLoads(url, timeoutMs = 2000) {
+	return new Promise(resolve => {
+		if (!url) return resolve(false);
+		const img = new Image();
+		let settled = false;
+		const finish = ok => { if (!settled) { settled = true; resolve(ok); } };
+		img.onload = () => finish(img.naturalWidth > 1);
+		img.onerror = () => finish(false);
+		setTimeout(() => finish(false), timeoutMs);
+		img.src = url;
+	});
+}
+
+// Start every candidate loading in PARALLEL, then resolve in priority order: returns
+// the highest-priority URL that loads. Because the loads run concurrently, a slow/dead
+// first candidate doesn't block the others — by the time we check them they're ready.
+async function ResolveAlbumArt(candidates) {
+	const checks = candidates.map(url => (url ? ImageLoads(url) : Promise.resolve(false)));
+	for (let i = 0; i < candidates.length; i++) {
+		if (candidates[i] && await checks[i]) return candidates[i];
+	}
+	return '';
 }
 
 async function SearchMusicBrainz(title, artist) {
@@ -1427,7 +1454,7 @@ async function SearchMusicBrainz(title, artist) {
 	if (!rec) return null;
 	
 	const releaseId = (rec.releases || [])[0]?.id;
-	const albumArt = releaseId ? `https://coverartarchive.org/release/${releaseId}/front` : '';
+	const albumArt = releaseId ? `https://coverartarchive.org/release/${releaseId}/front-500` : '';
 	
 	return {
 		title: rec.title || '',
@@ -1462,31 +1489,114 @@ async function SearchITunes(title, artist) {
 	};
 }
 
+// Read a Spotify TRACK's exact metadata from its public embed page (the same data the
+// Python scraper reads). The embed is CORS-blocked, so we go through a public CORS proxy
+// — meaning no server is needed on the streamer's PC, just the browser source. Returns
+// authoritative title/artist/duration/art (album name isn't in the embed; filled later).
+async function SpotifyEmbedInfo(url) {
+	const idMatch = url.match(/track[/:]([A-Za-z0-9]+)/);
+	if (!idMatch) return null;
+	const embed = 'https://open.spotify.com/embed/track/' + idMatch[1];
+	let html;
+	try {
+		const resp = await fetch('https://corsproxy.io/?url=' + encodeURIComponent(embed));
+		if (!resp.ok) return null;
+		html = await resp.text();
+	} catch (e) { return null; }
+
+	const m = html.match(/<script id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s);
+	if (!m) return null;
+	let entity;
+	try { entity = JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity; } catch (e) { return null; }
+	if (!entity || !entity.name) return null;
+
+	const artist = (entity.artists || []).map(a => a.name).filter(Boolean).join(', ') || entity.subtitle || '';
+	let albumArt = '';
+	const vi = entity.visualIdentity?.image || [];
+	if (vi.length) albumArt = vi.slice().sort((a, b) => (b.maxWidth || 0) - (a.maxWidth || 0))[0].url;
+	if (!albumArt && entity.coverArt?.sources?.length) albumArt = entity.coverArt.sources.slice().sort((a, b) => (b.width || 0) - (a.width || 0))[0].url;
+
+	return { title: entity.name, artist, durationMs: entity.duration || 0, albumArt, authoritative: true };
+}
+
+// Strip the usual junk from a (YouTube) video title: "(Official Video)", "[Audio]", etc.
+function CleanTrackTitle(t) {
+	const junk = /official|video|audio|lyric(?:s)?|visuali[sz]er|remaster(?:ed)?|\bhd\b|\b4k\b|\bmv\b|m\/v|explicit|music\s*video|color\s*coded/i;
+	return (t || '')
+		.replace(/\(([^()]*)\)/g, (full, inner) => junk.test(inner) ? '' : full)
+		.replace(/\[([^\[\]]*)\]/g, (full, inner) => junk.test(inner) ? '' : full)
+		.replace(/\s{2,}/g, ' ')
+		.trim();
+}
+
+// Resolve a YouTube / YouTube Music link to a {title, artist} seed via public oEmbed.
+// YouTube titles are usually "Artist - Song"; if there's no dash we fall back to the
+// channel name (minus "VEVO" / "- Topic") as the artist.
+async function YouTubeInfo(url) {
+	let resp;
+	try { resp = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(url)); }
+	catch (e) { return null; }
+	if (!resp.ok) return null;
+	const j = await resp.json();
+	const cleaned = CleanTrackTitle(j.title || '');
+	if (!cleaned) return null;
+
+	let title, artist;
+	const parts = cleaned.split(/\s+-\s+/);
+	if (parts.length >= 2) { artist = parts[0].trim(); title = parts.slice(1).join(' - ').trim(); }
+	else { title = cleaned; artist = (j.author_name || '').replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim(); }
+
+	return { title, artist, authoritative: false };
+}
+
 async function GetSongInfo(request) {
 	const input = (request || '').trim();
 	if (!input) { console.warn('[song] empty request'); return null; }
 
-	let title, artist;
-	if (/open\.spotify\.com|spotify:/i.test(input)) {
-		const oembedTitle = await SpotifyTitleFromUrl(input).catch(() => '');
-		({ title, artist } = ParseSongRequest(oembedTitle || input));
+	// Resolve the input into a search "seed". A Spotify track embed is authoritative
+	// (exact title/artist/duration/art); YouTube links and plain text only seed the search.
+	let seed = null;
+	if (/open\.spotify\.com\/track|spotify:track:/i.test(input)) {
+		seed = await SpotifyEmbedInfo(input);
+		if (!seed) {                                   // proxy/embed failed → oEmbed title + thumbnail
+			const sp = await SpotifyInfoFromUrl(input).catch(() => null);
+			if (sp) { const p = ParseSongRequest(sp.title || ''); seed = { title: p.title, artist: p.artist, albumArt: sp.thumbnail, authoritative: false }; }
+		}
+	} else if (/open\.spotify\.com|spotify:/i.test(input)) {   // album/playlist/other Spotify → best-effort
+		const sp = await SpotifyInfoFromUrl(input).catch(() => null);
+		if (sp) { const p = ParseSongRequest(sp.title || ''); seed = { title: p.title, artist: p.artist, albumArt: sp.thumbnail, authoritative: false }; }
+	} else if (/youtube\.com\/watch|youtu\.be\/|music\.youtube\.com/i.test(input)) {
+		seed = await YouTubeInfo(input);
 	} else {
-		({ title, artist } = ParseSongRequest(input));
+		const p = ParseSongRequest(input);
+		seed = { title: p.title, artist: p.artist, authoritative: false };
 	}
 
-	let info = null;
-	try { info = await SearchMusicBrainz(title, artist); } catch (e) { console.debug('[song] MusicBrainz error', e); }
-	if (!info || !info.albumArt) { 
-		try { 
-			const itunesInfo = await SearchITunes(title, artist); 
-			if (itunesInfo) info = itunesInfo; 
-		} catch (e) { console.debug('[song] iTunes error', e); } 
-	}
+	if (!seed || !seed.title) { console.warn(`[song] could not resolve "${input}"`); return null; }
 
-	if (!info) { console.warn(`[song] no match for "${input}"`); return null; }
+	// Enrich (album/duration/art + canonical names) via MusicBrainz + iTunes in parallel.
+	const [mb, itunes] = await Promise.all([
+		SearchMusicBrainz(seed.title, seed.artist).catch(e => { console.debug('[song] MusicBrainz error', e); return null; }),
+		SearchITunes(seed.title, seed.artist).catch(e => { console.debug('[song] iTunes error', e); return null; }),
+	]);
+	const enrich = mb || itunes || {};
+
+	let info, artCandidates;
+	if (seed.authoritative) {
+		// Trust the Spotify embed for title/artist/duration/art; only borrow the album name.
+		info = { title: seed.title, artist: seed.artist, album: enrich.album || '', durationMs: seed.durationMs || enrich.durationMs || 0 };
+		artCandidates = [seed.albumArt, itunes && itunes.albumArt, mb && mb.albumArt];
+	} else {
+		// Prefer the canonical search result; fall back to the raw seed if nothing matched.
+		info = enrich.title
+			? { title: enrich.title, artist: enrich.artist, album: enrich.album || '', durationMs: enrich.durationMs || 0 }
+			: { title: seed.title, artist: seed.artist, album: '', durationMs: 0 };
+		artCandidates = [itunes && itunes.albumArt, mb && mb.albumArt, seed.albumArt];
+	}
+	info.albumArt = await ResolveAlbumArt(artCandidates);
 
 	console.log(
-		`%c♪ ${info.title}%c\n   Artist:   ${info.artist}\n   Album:    ${info.album}\n   Duration: ${FormatSongDuration(info.durationMs)}\n   Art URL:  ${info.albumArt}`,
+		`%c♪ ${info.title}%c\n   Artist:   ${info.artist}\n   Album:    ${info.album}\n   Duration: ${FormatSongDuration(info.durationMs)}\n   Art URL:  ${info.albumArt || '(none found)'}`,
 		'font-weight:bold;font-size:13px', 'font-weight:normal'
 	);
 	return info;
