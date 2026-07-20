@@ -550,42 +550,78 @@ async function TwitchChatMessage(data) {
    On a triggering event this source: fades the chat out, holds the alert card,
    waits out the stinger, fades the chat back in, then renders the held card.
 
-   IMPORTANT: STINGER_SYNC must stay identical to the copy in the stinger's
-   script.js. If you change these numbers, change both.
+   The hidden window is NOT fixed — stingerContentMs() computes how long the
+   stinger actually needs for this event (a cheer's tip-jar length depends on how
+   many gems the bit amount throws; a sub is its frame-sequence length). The
+   stinger project computes the exact same number from the same event, so the two
+   stay in lockstep without messaging each other.
+
+   IMPORTANT: STINGER_SYNC + stingerContentMs/stingerCheerThrows must stay identical
+   to the copies in the stinger's script.js. If you change these, change both.
    ========================================================================= */
 const STINGER_SYNC = {
   chatFadeMs:    350,   // chat fade out / fade in (matches #mainContainer transition in style.css)
   stingerFadeMs: 300,   // the stinger source's own fade in/out
-  contentMs:     3000,  // how long the stinger stays fully on screen
+  // --- tip-jar timing model, mirrors the stinger's CFG so we can predict a cheer's length ---
+  fps:            25,
+  jarIntroFrames: 36,   // the jar-rise intro
+  throwStaggerMs: 170,  // gap between queued gem throws
+  throwFlightMs:  780,  // a gem's flight time
+  maxThrows:      40,   // the jar clamps a cheer to this many throws
+  cheerTailMs:    900,  // settle + hold the full jar after the last gem
+  subFrames:      65,   // sub-stinger frame count
+  subHoldMs:      550,  // hold the last sub frame before fading
+  bufferMs:       300,  // safety pad so the chat never fades in before the stinger is done
 };
-// how long the chat stays fully hidden while the stinger is on screen
-const STINGER_RESERVE_MS = STINGER_SYNC.stingerFadeMs * 2 + STINGER_SYNC.contentMs;
+
+// mirrors CFG.bitTiers decomposition in the stinger — how many gems a cheer throws
+function stingerCheerThrows(bits) {
+  const mins = [10000, 5000, 1000, 100, 10];
+  let rest = Math.max(0, Math.floor(bits) || 0), n = 0;
+  for (const m of mins) { const c = Math.floor(rest / m); if (c > 0) { rest -= c * m; n += c; } }
+  if (n === 0) n = 1;
+  return Math.min(n, STINGER_SYNC.maxThrows);
+}
+
+// On-screen time (ms) the stinger needs for an event — identical to the stinger's copy.
+function stingerContentMs(kind, data) {
+  const S = STINGER_SYNC;
+  if (kind === 'cheer') {
+    const n = stingerCheerThrows(data && data.bits);
+    const introMs  = S.jarIntroFrames / S.fps * 1000;
+    const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs;
+    return Math.round(introMs + throwsMs + S.cheerTailMs + S.bufferMs);
+  }
+  return Math.round(S.subFrames / S.fps * 1000 + S.subHoldMs + S.bufferMs);
+}
 
 let stingerCycleEndAt = 0;   // performance.now() when the held cards are released
 let stingerPendingCards = []; // card render thunks waiting for the chat to come back
 
-function startStingerCycle() {
+function startStingerCycle(contentMs) {
   const S = STINGER_SYNC, now = performance.now();
-  stingerCycleEndAt = now + S.chatFadeMs + STINGER_RESERVE_MS + S.chatFadeMs;
+  const hiddenBeforeFadeIn = S.chatFadeMs + contentMs;   // chat hidden until the stinger fades out
+  stingerCycleEndAt = now + hiddenBeforeFadeIn + S.chatFadeMs;
   mainContainer.classList.add('stinger-hidden');                         // fade chat out
   setTimeout(() => mainContainer.classList.remove('stinger-hidden'),     // fade chat back in
-             S.chatFadeMs + STINGER_RESERVE_MS);
+             hiddenBeforeFadeIn);
   setTimeout(() => {                                                     // chat is back -> show held cards
     const cards = stingerPendingCards; stingerPendingCards = [];
     cards.forEach(fn => { try { fn(); } catch (e) { console.error(e); } });
-    if (stingerPendingCards.length && performance.now() >= stingerCycleEndAt) startStingerCycle();
-  }, S.chatFadeMs + STINGER_RESERVE_MS + S.chatFadeMs);
+    if (stingerPendingCards.length && performance.now() >= stingerCycleEndAt) startStingerCycle(stingerContentMs('sub'));
+  }, hiddenBeforeFadeIn + S.chatFadeMs);
 }
 
 // Call on the RAW triggering event (before any gift-bomb accumulation) so the chat
-// fade lines up with the stinger, which fires on the same event. Bursts collapse
-// into the one active cycle. Passing the event's user pre-warms its avatar during
-// the hidden window so the held card pops in tight to the chat's return instead of
-// waiting on a fetch afterwards.
-function stingerTrigger(user) {
+// fade lines up with the stinger, which fires on the same event. kind is 'cheer' or
+// 'sub'; data carries the bit amount (cheer) and the user (avatar pre-warm). Bursts
+// collapse into the one active cycle. Pre-warming the avatar during the hidden window
+// lets the held card pop in tight to the chat's return instead of waiting on a fetch.
+function stingerTrigger(kind, data) {
   if (!stingersEnabled) return;
+  const user = data && data.user;
   if (user && user.name) GetAvatar(user.name, user.profileImageUrl, 'twitch');
-  if (performance.now() >= stingerCycleEndAt) startStingerCycle();
+  if (performance.now() >= stingerCycleEndAt) startStingerCycle(stingerContentMs(kind, data));
 }
 
 // Wrap the actual card render. When a cycle is active the card is held until the
@@ -597,8 +633,8 @@ function stingerGateCard(thunk) {
   else thunk();
 }
 
-async function TwitchSub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); stingerGateCard(() => renderEventCard(data, 'sub', 'twitch')); }
-async function TwitchResub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); stingerGateCard(() => renderEventCard(data, 'resub', 'twitch')); }
+async function TwitchSub(data) { if (!showTwitchSubs) return; stingerTrigger('sub', data); stingerGateCard(() => renderEventCard(data, 'sub', 'twitch')); }
+async function TwitchResub(data) { if (!showTwitchSubs) return; stingerTrigger('sub', data); stingerGateCard(() => renderEventCard(data, 'resub', 'twitch')); }
 async function TwitchRaid(data) {
 	if (!showTwitchRaids) return;
 	if (!data.user) data.user = { id: data.from_broadcaster_user_id, name: data.from_broadcaster_user_name, login: data.from_broadcaster_user_login };
@@ -686,7 +722,7 @@ async function TwitchFollow(data) {
 // ===== Cheer / Bits (dedicated branded card) =====
 async function TwitchCheer(data) {
 	if (!showTwitchCheers) return;
-	stingerTrigger(data.user);
+	stingerTrigger('cheer', data);
 	const rawText = typeof data.message === 'string' ? data.message : (data.message?.message || '');
 	// Strip only identified cheermote tokens (e.g. "Cheer100") using the same
 	// cheerEmotes array Streamer.bot provides, leaving the actual typed message.
@@ -850,7 +886,7 @@ function flushGiftBomb(key) {
 	else gate(() => renderEventCard({ ...data, giftCount: count, recipient: null, messageId: `giftbomb-${Date.now()}` }, 'giftbomb', platform));
 }
 
-async function TwitchGiftSub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); accumulateGift(data, 'twitch'); }
+async function TwitchGiftSub(data) { if (!showTwitchSubs) return; stingerTrigger('sub', data); accumulateGift(data, 'twitch'); }
 
 function TwitchChatMessageDeleted(data) {
 	document.querySelectorAll(`li[id="${data.messageId}"]`).forEach(item => {
