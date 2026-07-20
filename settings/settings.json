@@ -403,6 +403,15 @@
 			"group": "Which TikTok messages do you want to see?"
 		},
 		{
+			"id": "stingers",
+			"label": "Enable Stingers",
+			"description": "Fade the chat out for the stinger overlay on subs & cheers, then fade back in and show the alert. Requires the separate stinger browser source added on top. Only added to the URL when on.",
+			"type": "checkbox",
+			"defaultValue": false,
+			"omitWhenDefault": true,
+			"group": "Stingers"
+		},
+		{
 			"id": "address",
 			"label": "Address",
 			"description": "Streamer.bot Websocket Server Address",

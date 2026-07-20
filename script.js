@@ -46,6 +46,12 @@ const showTwitchChannelPoints = GetBooleanParam("showTwitchChannelPoints", true)
 const showTwitchPowerUps = GetBooleanParam("showTwitchPowerUps", true);
 const showTwitchWatchStreaks = GetBooleanParam("showTwitchWatchStreaks", true);
 
+// Stinger sync: when ON, a Twitch sub/resub/gift/bomb or cheer fades the chat out,
+// lets the separate stinger browser source play, then fades the chat back in and
+// only THEN shows the alert card. Default OFF so existing links (no ?stingers) are
+// unchanged — the settings page only appends ?stingers=true when it's enabled.
+const stingersEnabled = GetBooleanParam("stingers", false);
+
 const showYouTubeMessages = GetBooleanParam("showYouTubeMessages", true);
 const showYouTubeSuperChats = GetBooleanParam("showYouTubeSuperChats", true);
 const showYouTubeSuperStickers = GetBooleanParam("showYouTubeSuperStickers", true);
@@ -277,14 +283,15 @@ async function renderEventCard(data, type, platform, opts = {}) {
 	const iconImg = instance.querySelector(".sub-skull-icon");
 	const iconArea = instance.querySelector(".sub-icon-area"); // Grab the invisible spacer box
 
-	// Add cheer and watchstreak to the condition so their icons are removed
-	if (type === 'channelpoint' || type === 'powerup' || type === 'cheer' || type === 'watchstreak') { 
+	// Icon-less event types: remove the image and the invisible spacer entirely
+	// (cheer now gets a tier-colored bit-jar icon passed in via opts.icon)
+	if (type === 'channelpoint' || type === 'powerup' || type === 'watchstreak') {
 		// Completely delete the image and the invisible spacing box from the HTML!
 		if (iconImg) iconImg.remove();
 		if (iconArea) iconArea.remove();
 	} else { 
 		// Event type -> [icon file, css class]. New categories use placeholder icons
-		// cheer and watchstreak have been removed from this map
+		// watchstreak has been removed from this map; cheer passes its icon via opts
 		const ICON_MAP = {
 			raid: ['icons/raid-bell.svg', 'sub-raid-icon'],
 			donation: ['icons/donation-paper-bag.svg', 'sub-donation-icon'],
@@ -333,8 +340,10 @@ async function renderEventCard(data, type, platform, opts = {}) {
 	}
 	
 	if (isIndividualGift) {
+		const subUserContent = instance.querySelector(".sub-user-content");
 		const receiverSpan = instance.querySelector("#gift-receiver");
 		if (receiverSpan) {
+			subUserContent.classList.add('is-gift');
 			receiverSpan.style.display = 'flex';
 			const recAvatarDiv = instance.querySelector("#receiver-avatar");
 			if (showAvatar) {
@@ -342,11 +351,32 @@ async function renderEventCard(data, type, platform, opts = {}) {
 				recAvatarDiv.innerHTML = `<img src="${recAvatarURL}" class="avatar">`;
 			}
 			if (showPlatform) instance.querySelector("#receiver-platform").innerHTML = `<img src="icons/platforms/${platform}.png" class="platform"/>`;
-			
+
+			// Sender + receiver names become scrolling marquees that split the row's
+			// width by max-min fairness (allocateGiftRow), replacing the old ellipsis.
+			const senderColor = tameUsernameColor(opts.color || data.user?.color || GetPlatformColor(platform));
+			const receiverColor = tameUsernameColor(opts.color || data.recipient?.color || GetPlatformColor(platform));
+			const senderText = showUsername ? senderName : '';
+
+			// Wrap the sender's avatar · platform · name into one flex cell.
+			const giftSender = document.createElement('div');
+			giftSender.className = 'gift-sender';
+			giftSender.append(avatarDiv, platformDiv);
+			giftSender.insertAdjacentHTML('beforeend', marqueeHTML(senderText, { mode: 'fadeswap', fade: true, cls: 'gift-name' }));
+			giftSender.querySelector('.mq').style.color = senderColor;
+			subUserContent.insertBefore(giftSender, receiverSpan);
+			usernameDiv.remove();
+
+			// Receiver name marquee replaces the #receiver-username span.
 			const recUsernameDiv = instance.querySelector("#receiver-username");
-			recUsernameDiv.innerText = receiverName;
-			recUsernameDiv.style.color = tameUsernameColor(opts.color || data.recipient?.color || GetPlatformColor(platform));
+			recUsernameDiv.insertAdjacentHTML('beforebegin', marqueeHTML(receiverName, { mode: 'fadeswap', fade: true, cls: 'gift-name' }));
+			recUsernameDiv.previousElementSibling.style.color = receiverColor;
+			recUsernameDiv.remove();
 		}
+	} else if (showUsername) {
+		// Non-gift event cards: the single sender username also fade-scrolls
+		// instead of truncating with "…".
+		usernameDiv.replaceWith(usernameMarquee(senderName, usernameDiv.style.color));
 	}
 
 	// opts.description (may contain HTML) overrides the built-in text for a type.
@@ -401,6 +431,10 @@ async function renderEventCard(data, type, platform, opts = {}) {
 		commentWrapper.style.display = "block";
 		const commentTextEl = instance.querySelector(".sub-comment-text");
 		commentTextEl.innerHTML = opts.htmlContent;
+		// Song-request cards get slightly wider right padding (see .is-song-request in CSS).
+		if (/music-ui-container/.test(opts.htmlContent)) {
+			commentWrapper.querySelector(".sub-comment-content")?.classList.add("is-song-request");
+		}
 		hasComment = true;
 	} else if (message && message.trim().length > 0) {
 		commentWrapper.style.display = "block";
@@ -504,8 +538,67 @@ async function TwitchChatMessage(data) {
 	}
 }
 
-async function TwitchSub(data) { if (showTwitchSubs) await renderEventCard(data, 'sub', 'twitch'); }
-async function TwitchResub(data) { if (showTwitchSubs) await renderEventCard(data, 'resub', 'twitch'); }
+/* =========================================================================
+   Stinger sync (see also the stinger project's script.js)
+   -------------------------------------------------------------------------
+   The stinger is a SEPARATE OBS browser source layered above this chat. OBS
+   isolates browser sources, so the two can't message each other — instead they
+   both subscribe to the same Streamer.bot events and run their halves of ONE
+   shared, fixed timeline. Because both receive the same event at the same
+   instant, they stay in lockstep with no cross-source messaging.
+
+   On a triggering event this source: fades the chat out, holds the alert card,
+   waits out the stinger, fades the chat back in, then renders the held card.
+
+   IMPORTANT: STINGER_SYNC must stay identical to the copy in the stinger's
+   script.js. If you change these numbers, change both.
+   ========================================================================= */
+const STINGER_SYNC = {
+  chatFadeMs:    350,   // chat fade out / fade in (matches #mainContainer transition in style.css)
+  stingerFadeMs: 300,   // the stinger source's own fade in/out
+  contentMs:     3000,  // how long the stinger stays fully on screen
+};
+// how long the chat stays fully hidden while the stinger is on screen
+const STINGER_RESERVE_MS = STINGER_SYNC.stingerFadeMs * 2 + STINGER_SYNC.contentMs;
+
+let stingerCycleEndAt = 0;   // performance.now() when the held cards are released
+let stingerPendingCards = []; // card render thunks waiting for the chat to come back
+
+function startStingerCycle() {
+  const S = STINGER_SYNC, now = performance.now();
+  stingerCycleEndAt = now + S.chatFadeMs + STINGER_RESERVE_MS + S.chatFadeMs;
+  mainContainer.classList.add('stinger-hidden');                         // fade chat out
+  setTimeout(() => mainContainer.classList.remove('stinger-hidden'),     // fade chat back in
+             S.chatFadeMs + STINGER_RESERVE_MS);
+  setTimeout(() => {                                                     // chat is back -> show held cards
+    const cards = stingerPendingCards; stingerPendingCards = [];
+    cards.forEach(fn => { try { fn(); } catch (e) { console.error(e); } });
+    if (stingerPendingCards.length && performance.now() >= stingerCycleEndAt) startStingerCycle();
+  }, S.chatFadeMs + STINGER_RESERVE_MS + S.chatFadeMs);
+}
+
+// Call on the RAW triggering event (before any gift-bomb accumulation) so the chat
+// fade lines up with the stinger, which fires on the same event. Bursts collapse
+// into the one active cycle. Passing the event's user pre-warms its avatar during
+// the hidden window so the held card pops in tight to the chat's return instead of
+// waiting on a fetch afterwards.
+function stingerTrigger(user) {
+  if (!stingersEnabled) return;
+  if (user && user.name) GetAvatar(user.name, user.profileImageUrl, 'twitch');
+  if (performance.now() >= stingerCycleEndAt) startStingerCycle();
+}
+
+// Wrap the actual card render. When a cycle is active the card is held until the
+// chat fades back in; otherwise (stingers off, or the rare event that lands after
+// the window) it renders immediately, so behaviour is unchanged when disabled.
+function stingerGateCard(thunk) {
+  if (!stingersEnabled) return thunk();
+  if (performance.now() < stingerCycleEndAt) stingerPendingCards.push(thunk);
+  else thunk();
+}
+
+async function TwitchSub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); stingerGateCard(() => renderEventCard(data, 'sub', 'twitch')); }
+async function TwitchResub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); stingerGateCard(() => renderEventCard(data, 'resub', 'twitch')); }
 async function TwitchRaid(data) {
 	if (!showTwitchRaids) return;
 	if (!data.user) data.user = { id: data.from_broadcaster_user_id, name: data.from_broadcaster_user_name, login: data.from_broadcaster_user_login };
@@ -559,8 +652,7 @@ async function renderFollowCard(data, platform, action = 'followed') {
 	const name = data.user?.name || 'Someone';
 
 	if (showUsername) {
-		usernameDiv.innerText = name;
-		usernameDiv.style.color = tameUsernameColor(GetPlatformColor(platform));
+		usernameDiv.replaceWith(usernameMarquee(name, tameUsernameColor(GetPlatformColor(platform))));
 	}
 
 	if (showPlatform && PLATFORMS_WITH_ICONS.has(platform)) {
@@ -594,6 +686,7 @@ async function TwitchFollow(data) {
 // ===== Cheer / Bits (dedicated branded card) =====
 async function TwitchCheer(data) {
 	if (!showTwitchCheers) return;
+	stingerTrigger(data.user);
 	const rawText = typeof data.message === 'string' ? data.message : (data.message?.message || '');
 	// Strip only identified cheermote tokens (e.g. "Cheer100") using the same
 	// cheerEmotes array Streamer.bot provides, leaving the actual typed message.
@@ -605,23 +698,25 @@ async function TwitchCheer(data) {
 	}
 	text = text.trim();
 
-	// Pick the correct bit gem color + matching outline based on cheer amount.
+	// Pick the bit gem color based on cheer amount (local bit-<color>.svg icons).
 	// Twitch tiers: 1-99 gray, 100-999 purple, 1000-4999 green, 5000-9999 blue, 10000+ red.
 	const bits = data.bits || 0;
-	let bitColor, outlineColor;
-	if      (bits >= 10000) { bitColor = 'red';    outlineColor = '#7a0000'; }
-	else if (bits >= 5000)  { bitColor = 'blue';   outlineColor = '#1a3a7a'; }
-	else if (bits >= 1000)  { bitColor = 'green';  outlineColor = '#005000'; }
-	else if (bits >= 100)   { bitColor = 'purple'; outlineColor = '#5e1a9e'; }
-	else                    { bitColor = 'gray';   outlineColor = '#3a3a3a'; }
+	let bitColor;
+	if      (bits >= 10000) bitColor = 'red';
+	else if (bits >= 5000)  bitColor = 'blue';
+	else if (bits >= 1000)  bitColor = 'green';
+	else if (bits >= 100)   bitColor = 'purple';
+	else                    bitColor = 'gray';
 
-	const staticBitUrl = `https://static-cdn.jtvnw.net/bits/dark/static/${bitColor}/2`;
-	const outlinedUrl = await makeOutlinedIcon(staticBitUrl, 5, outlineColor);
-
-	const bitIcon = `<img src="${outlinedUrl}" class="sub-inline-icon" style="filter: none; height: 1.3em; width: auto; margin-left: 1px; margin-right: 0; vertical-align: -0.3em;">`;
+	const bitIcon = `<img src="icons/bit-${bitColor}.svg" class="sub-bit-gem-icon">`;
 
 	const description = `Cheered ${data.bits}${bitIcon}`;
-	await renderEventCard({ user: data.user, bits: data.bits, text }, 'cheer', 'twitch', { description });
+	// Tier-colored bit-jar card icon, matching the gem color picked above.
+	stingerGateCard(() => renderEventCard({ user: data.user, bits: data.bits, text }, 'cheer', 'twitch', {
+		description,
+		icon: `icons/bit-jar-${bitColor}.svg`,
+		iconClass: 'sub-bit-jar-icon',
+	}));
 }
 const _outlineCache = new Map();
 function makeOutlinedIcon(srcUrl, outlinePx = 5, outlineColor = '#000') {
@@ -685,14 +780,16 @@ async function TwitchRewardRedemption(data) {
 			// Fallback transparent pixel if no art is found so the layout doesn't break
 			const artUrl = songInfo.albumArt || 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 
+			// Title / album / artist scroll (Apple-smooth wrap) instead of ellipsis-
+			// truncating, ported from collage.html's song-request card.
 			htmlContent = `
 				<div class="music-ui-container">
 					<img class="music-ui-art" src="${artUrl}" onerror="this.style.display='none'" />
 					<div class="music-ui-info">
-						<div class="music-ui-title">${escapeHtml(songInfo.title)}</div>
-						${songInfo.album ? `<div class="music-ui-album">${escapeHtml(songInfo.album)}</div>` : ''}
+						${marqueeHTML(songInfo.title, { mode: 'smooth', fade: true, cls: 'music-ui-title' })}
+						${songInfo.album ? marqueeHTML(songInfo.album, { mode: 'smooth', fade: true, cls: 'music-ui-album' }) : ''}
 						<div class="music-ui-artist-row">
-							<span class="music-ui-artist">${escapeHtml(songInfo.artist)}</span>
+							${marqueeHTML(songInfo.artist, { mode: 'smooth', fade: true, cls: 'music-ui-artist' })}
 							<span class="music-ui-duration">
 								<img src="icons/icon-clock.svg" class="music-ui-clock" />
 								${FormatSongDuration(songInfo.durationMs)}
@@ -747,11 +844,13 @@ function flushGiftBomb(key) {
 	giftBombBuffer.delete(key);
 	const { data, platform, count } = entry;
 
-	if (count === 1) renderEventCard(data, 'gift', platform);
-	else renderEventCard({ ...data, giftCount: count, recipient: null, messageId: `giftbomb-${Date.now()}` }, 'giftbomb', platform);
+	// Only Twitch gifts drive the stinger; other platforms render immediately.
+	const gate = (platform === 'twitch') ? stingerGateCard : (fn => fn());
+	if (count === 1) gate(() => renderEventCard(data, 'gift', platform));
+	else gate(() => renderEventCard({ ...data, giftCount: count, recipient: null, messageId: `giftbomb-${Date.now()}` }, 'giftbomb', platform));
 }
 
-async function TwitchGiftSub(data) { if (showTwitchSubs) accumulateGift(data, 'twitch'); }
+async function TwitchGiftSub(data) { if (!showTwitchSubs) return; stingerTrigger(data.user); accumulateGift(data, 'twitch'); }
 
 function TwitchChatMessageDeleted(data) {
 	document.querySelectorAll(`li[id="${data.messageId}"]`).forEach(item => {
@@ -1211,6 +1310,200 @@ function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 	requestAnimationFrame(tick);
 }
 
+/* ════════════════════════════════════════════════════════════════
+   Marquee driver — ported from Music-Info-Card/test/collage.html.
+   Two modes share ONE velocity profile (ease-in → cruise → ease-out):
+     smooth   — Apple wrap: two copies, rest at home, cruise once around, loop.
+     fadeswap — cruise to the end, hold, fade out, reset home, fade back in.
+   Each card is its own timing group; a group's clock starts the moment the
+   card is measured, so every card gets the same rest → scroll → loop rhythm
+   from when it appears. The old "…" (text-overflow: ellipsis) treatment is
+   replaced by these scrolling windows.
+   ════════════════════════════════════════════════════════════════ */
+const MQ = { speed: 50, fadePx: 8, pauseStart: 2000, easeMs: 650, smoothGap: 24, holdEnd: 900, fadeMs: 100, homeHold: 40 };
+const MQ_V_CRUISE = MQ.speed / 1000;              // px per ms cruise velocity
+const MQ_A_RAMP   = MQ_V_CRUISE / MQ.easeMs;      // px per ms² fixed accel/decel
+
+// Total time to cover distance D under the shared accel → cruise → decel profile.
+function mqScrollMs(D) {
+	if (D <= 0) return 0;
+	if (D >= MQ_V_CRUISE * MQ.easeMs) return D / MQ_V_CRUISE + MQ.easeMs;   // trapezoid
+	return 2 * Math.sqrt(D / MQ_A_RAMP);                                    // triangle (too short to cruise)
+}
+// How far a line of distance D has moved `st` ms into its scroll (capped at D).
+function mqTravel(D, st) {
+	if (D <= 0 || st <= 0) return 0;
+	const T = mqScrollMs(D); if (st >= T) return D;
+	if (D >= MQ_V_CRUISE * MQ.easeMs) {
+		const E = MQ.easeMs;
+		if (st < E)     return 0.5 * MQ_A_RAMP * st * st;                          // accelerate
+		if (st < T - E) return 0.5 * MQ_V_CRUISE * E + MQ_V_CRUISE * (st - E);     // cruise
+		const q = T - st; return D - 0.5 * MQ_A_RAMP * q * q;                      // decelerate
+	}
+	const half = T / 2;
+	if (st < half) return 0.5 * MQ_A_RAMP * st * st;
+	const q = T - st; return D - 0.5 * MQ_A_RAMP * q * q;
+}
+
+const mqActive = [];   // live marquee runtime objects, ticked by one shared rAF loop
+
+// Build the HTML for a marquee window. `smooth` lays down two wrapped copies;
+// every other mode uses a single run. data-mq-mode is read back at measure time.
+function marqueeHTML(text, { mode = 'fadeswap', fade = true, cls = '' } = {}) {
+	const safe = escapeHtml(text == null ? '' : String(text));
+	const winCls = 'mq' + (fade ? ' fade' : '') + (cls ? ' ' + cls : '');
+	if (mode === 'smooth') {
+		return `<div class="${winCls}" data-mq-mode="smooth"><span class="mq-inner" style="display:inline-flex;gap:${MQ.smoothGap}px">` +
+			`<span class="mq-copy">${safe}</span><span class="mq-copy" aria-hidden="true">${safe}</span></span></div>`;
+	}
+	return `<div class="${winCls}" data-mq-mode="${mode}"><span class="mq-inner">${safe}</span></div>`;
+}
+
+// A fade-scroll username marquee element, used everywhere a username used to
+// truncate with "…". Returns the .mq node ready to drop in place of a #username span.
+function usernameMarquee(text, color) {
+	const tpl = document.createElement('template');
+	tpl.innerHTML = marqueeHTML(text, { mode: 'fadeswap', fade: true, cls: 'name-mq' }).trim();
+	const mq = tpl.content.firstElementChild;
+	if (color) mq.style.color = color;
+	return mq;
+}
+
+// Apply the edge fade by writing the mask gradient INLINE (l, r are 0→1 fade
+// presence per edge). We set the full mask-image string rather than driving a
+// registered @property inside a CSS calc(): Chromium doesn't reliably repaint a
+// mask gradient when only the custom property changes, so on stacked cards all
+// but the first rendered a hard clip instead of the fade. The band width is a
+// fixed MQ.fadePx (px, not %) so it stays soft on the narrow ~80px name windows.
+function mqApplyFade(m, l, r) {
+	if (!m.fade) return;
+	let g = '';   // '' → no mask (no fade) when the line doesn't overflow
+	if (m.O > 0) {
+		const lp = (l * MQ.fadePx).toFixed(2), rp = (r * MQ.fadePx).toFixed(2);
+		g = `linear-gradient(90deg, transparent 0, #000 ${lp}px, #000 calc(100% - ${rp}px), transparent 100%)`;
+	}
+	if (g === m._mask) return;   // skip redundant style writes
+	m._mask = g;
+	m.win.style.webkitMaskImage = g;
+	m.win.style.maskImage = g;
+}
+
+function mqSetEdgeFade(m, off) {   // off ≤ 0; grows the left / right fade with overflow
+	const l = m.O ? Math.min(1, (-off) / MQ.fadePx) : 0;
+	const r = m.O ? Math.min(1, (m.O + off) / MQ.fadePx) : 0;
+	mqApplyFade(m, l, r);
+}
+
+function mqTickSmooth(m, t) {
+	if (m.O <= 0) { m.inner.style.transform = 'translateX(0)'; mqApplyFade(m, 0, 0); return; }
+	const tt = t % m.group.cycle;
+	const off = tt < MQ.pauseStart ? 0 : -mqTravel(m.unit, tt - MQ.pauseStart);
+	m.inner.style.transform = `translateX(${off}px)`;
+	const d = Math.min(-off, m.unit + off);   // distance from the nearest home edge
+	mqApplyFade(m, Math.max(0, Math.min(1, d / MQ.fadePx)), 1);   // wrapped copy always overflows the right
+}
+
+function mqTickFadeswap(m, t) {
+	if (m.O <= 0) { m.inner.style.transform = 'translateX(0)'; m.inner.style.opacity = 1; mqSetEdgeFade(m, 0); return; }
+	const tt = t % m.group.cycle;
+	const s0 = MQ.pauseStart, s1 = s0 + m.group.scrollDur, s2 = s1 + MQ.holdEnd, s3 = s2 + MQ.fadeMs, s4 = s3 + MQ.homeHold;
+	let off = 0, op = 1;
+	if (tt < s0)      { off = 0;  op = 1; }
+	else if (tt < s1) { off = -mqTravel(m.O, tt - s0); op = 1; }              // cruise (caps at -O, holds)
+	else if (tt < s2) { off = -m.O; op = 1; }                                // hold at end
+	else if (tt < s3) { off = -m.O; op = 1 - (tt - s2) / MQ.fadeMs; }         // fade out
+	else if (tt < s4) { off = 0;  op = 0; }                                   // reset home, hidden
+	else              { off = 0;  op = Math.min(1, (tt - s4) / MQ.fadeMs); }  // fade in
+	m.inner.style.transform = `translateX(${off}px)`;
+	m.inner.style.opacity = op.toFixed(3);
+	mqSetEdgeFade(m, off);
+}
+
+function mqTickPark(m, t) {
+	const off = (m.O > 0 && t > MQ.pauseStart) ? -mqTravel(m.O, t - MQ.pauseStart) : 0;
+	m.inner.style.transform = `translateX(${off}px)`; mqSetEdgeFade(m, off);
+}
+
+function mqLoop(now) {
+	for (let i = mqActive.length - 1; i >= 0; i--) {
+		const m = mqActive[i];
+		if (!m.win.isConnected) { mqActive.splice(i, 1); continue; }   // card was removed → drop it
+		if (!m.group || !m.group.ready) continue;
+		const t = now - m.group.t0;
+		switch (m.mode) {
+			case 'smooth':   mqTickSmooth(m, t); break;
+			case 'fadeswap': mqTickFadeswap(m, t); break;
+			default:         mqTickPark(m, t); break;
+		}
+	}
+	requestAnimationFrame(mqLoop);
+}
+requestAnimationFrame(mqLoop);
+
+/* Gift-sub two-name width sharing (max-min fairness), ported from collage.html:
+     both fit        → each takes exactly what it needs (no scroll)
+     one short/long  → short takes what it needs, long gets the rest
+     both over half  → an even 50/50 split
+   Run before measuring so each name's window width feeds its own overflow. */
+function mqNaturalW(win) { const inner = win.querySelector('.mq-inner'); return inner ? inner.scrollWidth : win.scrollWidth; }
+function mqFairSplit(avail, n1, n2) {
+	if (n1 + n2 <= avail) return [n1, n2];
+	const half = avail / 2;
+	if (n1 <= half) return [n1, avail - n1];
+	if (n2 <= half) return [avail - n2, n2];
+	return [half, half];
+}
+function allocateGiftRow(root) {
+	const content = root.querySelector('.sub-user-content.is-gift');
+	if (!content) return;
+	const cellA = content.querySelector('.gift-sender');
+	const cellB = content.querySelector('#gift-receiver');
+	const textA = cellA && cellA.querySelector('.mq');
+	const textB = cellB && cellB.querySelector('.mq');
+	if (!cellA || !cellB || !textA || !textB) return;
+	// collapse both names to 0 so each cell reports just its fixed part
+	// (avatar · platform · arrow), read the usable width, then share it.
+	textA.style.flex = '0 0 auto'; textA.style.width = '0px';
+	textB.style.flex = '0 0 auto'; textB.style.width = '0px';
+	cellA.style.flex = '0 0 auto'; cellB.style.flex = '0 0 auto';
+	const availText = Math.max(0, content.clientWidth - cellA.offsetWidth - cellB.offsetWidth);
+	const [wA, wB] = mqFairSplit(availText, mqNaturalW(textA), mqNaturalW(textB));
+	textA.style.width = Math.floor(wA) + 'px';
+	textB.style.width = Math.floor(wB) + 'px';
+}
+
+// Discover every .mq in a freshly-added card, build its runtime object, measure
+// overflow, and start the card's shared clock. One timing group per card.
+function startCardMarquees(root) {
+	allocateGiftRow(root);   // share gift-name widths first, then measure overflow
+	const wins = root.querySelectorAll('.mq');
+	if (!wins.length) return;
+	const group = { scrollDur: 0, fadeTail: 0, cycle: 4000, t0: performance.now(), ready: false };
+	let maxDist = 0, hasFade = false;
+	wins.forEach(win => {
+		const m = { win, inner: win.querySelector('.mq-inner'), fade: win.classList.contains('fade'), mode: win.dataset.mqMode || 'park', group, O: 0, unit: 0 };
+		if (m.mode === 'smooth') {
+			const copies = win.querySelectorAll('.mq-copy');
+			const copyW = copies[0] ? copies[0].offsetWidth : m.inner.scrollWidth;
+			m.O = Math.max(0, Math.round(copyW - win.clientWidth));
+			m.unit = copyW + MQ.smoothGap;
+			// only reveal the wrapped 2nd copy when the text actually overflows
+			if (copies[1]) copies[1].style.display = m.O > 0 ? '' : 'none';
+			if (m.O > 0) maxDist = Math.max(maxDist, m.unit);
+		} else {
+			m.O = Math.max(0, Math.round(m.inner.scrollWidth - win.clientWidth));
+			if (m.O > 0) { maxDist = Math.max(maxDist, m.O); if (m.mode === 'fadeswap') hasFade = true; }
+		}
+		mqActive.push(m);
+	});
+	// the longest line sets the card's scroll time; shorter siblings reach their
+	// end sooner and hold there until the whole card loops together.
+	group.scrollDur = mqScrollMs(maxDist);
+	group.fadeTail = hasFade ? (MQ.holdEnd + MQ.fadeMs + MQ.homeHold + MQ.fadeMs) : 0;
+	group.cycle = MQ.pauseStart + group.scrollDur + group.fadeTail;
+	group.ready = true;
+}
+
 function AddMessageItem(element, elementID, platform, userId, customClasses = [], onAdded = null) {
 	const tempContainer = document.createElement('div');
 	tempContainer.style.cssText = `position:absolute; visibility:hidden; width:${BASE_WIDTH}px; pointer-events:none;`;
@@ -1288,7 +1581,11 @@ function AddSubCardItem(element, elementID, platform, userId) {
 
 		const commentCanvas = li.querySelector('.sub-comment-border-canvas');
 		if (commentCanvas && commentWrapperEl && commentWrapperEl.style.display !== 'none') tryInitBorder(commentCanvas, commentWrapperEl, 0);
-	}); 
+
+		// Measure + start any scrolling name / song-info marquees now that the card
+		// is in the real layout (gift sender+receiver names, song-request info).
+		startCardMarquees(li);
+	});
 }
 
 function GetBooleanParam(paramName, defaultValue) {
@@ -1579,21 +1876,42 @@ async function GetSongInfo(request) {
 		SearchMusicBrainz(seed.title, seed.artist).catch(e => { console.debug('[song] MusicBrainz error', e); return null; }),
 		SearchITunes(seed.title, seed.artist).catch(e => { console.debug('[song] iTunes error', e); return null; }),
 	]);
-	const enrich = mb || itunes || {};
-
-	let info, artCandidates;
+	// Resolve the album ART first, then take title/artist/album from whichever service
+	// actually supplied that working art — so the text on the card always matches the
+	// artwork shown. This is what makes the result "right" far more often than blindly
+	// trusting MusicBrainz: a wrong/obscure MB match no longer overrides a correct iTunes
+	// one. If no art source loaded, fall back to iTunes text, then MusicBrainz.
+	let info;
 	if (seed.authoritative) {
-		// Trust the Spotify embed for title/artist/duration/art; only borrow the album name.
-		info = { title: seed.title, artist: seed.artist, album: enrich.album || '', durationMs: seed.durationMs || enrich.durationMs || 0 };
-		artCandidates = [seed.albumArt, itunes && itunes.albumArt, mb && mb.albumArt];
+		// Authoritative seed (Spotify embed): keep its own title/artist/duration/art;
+		// only borrow the album name, matched to whichever source provided the art.
+		const artCandidates = [seed.albumArt, itunes && itunes.albumArt, mb && mb.albumArt];
+		const resolvedArt = await ResolveAlbumArt(artCandidates);
+		let album = '';
+		if (resolvedArt && itunes && resolvedArt === itunes.albumArt) album = itunes.album;
+		else if (resolvedArt && mb && resolvedArt === mb.albumArt) album = mb.album;
+		else album = (itunes || mb || {}).album || '';
+		info = {
+			title: seed.title,
+			artist: seed.artist,
+			album,
+			durationMs: seed.durationMs || (itunes || mb || {}).durationMs || 0,
+			albumArt: resolvedArt,
+		};
 	} else {
-		// Prefer the canonical search result; fall back to the raw seed if nothing matched.
-		info = enrich.title
-			? { title: enrich.title, artist: enrich.artist, album: enrich.album || '', durationMs: enrich.durationMs || 0 }
-			: { title: seed.title, artist: seed.artist, album: '', durationMs: 0 };
-		artCandidates = [itunes && itunes.albumArt, mb && mb.albumArt, seed.albumArt];
+		// Non-authoritative seed: make the displayed text match the artwork we end up showing.
+		const artCandidates = [itunes && itunes.albumArt, mb && mb.albumArt, seed.albumArt];
+		const resolvedArt = await ResolveAlbumArt(artCandidates);
+		let bestSource = null;
+		if (resolvedArt) {
+			if (itunes && resolvedArt === itunes.albumArt) bestSource = itunes;
+			else if (mb && resolvedArt === mb.albumArt) bestSource = mb;
+		}
+		if (!bestSource) bestSource = itunes || mb || {};   // no art matched → prefer iTunes text, then MB
+		info = bestSource.title
+			? { title: bestSource.title, artist: bestSource.artist, album: bestSource.album || '', durationMs: bestSource.durationMs || 0, albumArt: resolvedArt }
+			: { title: seed.title, artist: seed.artist, album: '', durationMs: 0, albumArt: resolvedArt };
 	}
-	info.albumArt = await ResolveAlbumArt(artCandidates);
 
 	console.log(
 		`%c♪ ${info.title}%c\n   Artist:   ${info.artist}\n   Album:    ${info.album}\n   Duration: ${FormatSongDuration(info.durationMs)}\n   Art URL:  ${info.albumArt || '(none found)'}`,

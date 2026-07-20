@@ -50,7 +50,11 @@ html, body {
 	box-sizing: border-box;
 	transform: translateZ(0);
     will-change: transform;
+	/* stinger sync: chat fades out/in around a stinger. Duration must match
+	   STINGER_SYNC.chatFadeMs in script.js. */
+	transition: opacity 350ms ease;
 }
+#mainContainer.stinger-hidden { opacity: 0; }
 
 #mainContainer.show-gradient {
     -webkit-mask-image: linear-gradient(to bottom,
@@ -384,6 +388,13 @@ li.sub-card-li {
 	min-height: 40px;
 }
 
+/* Song-request cards get a touch more right breathing room (16px vs the default 12px)
+   so the album-art / marquee sit less tight against the card edge. Class is added in
+   renderEventCard when the comment holds a song card. */
+.sub-comment-content.is-song-request {
+	padding-right: 16px;
+}
+
 .sub-raid-icon {
 	position: absolute;
 	width: 68px;
@@ -412,6 +423,19 @@ li.sub-card-li {
 	height: 63px;
 	left: 12px;
 	top: 12px;
+	object-fit: contain;
+	z-index: 2;
+	pointer-events: none;
+}
+
+/* Tier-colored bit-jar icon on cheer cards (bit-jar-gray/purple/green/blue/red.svg).
+   Pinned to the alert container's top-left corner at native SVG size. */
+.sub-bit-jar-icon {
+	position: absolute;
+	width: 81px;
+	height: 81px;
+	left: 0;
+	top: 0;
 	object-fit: contain;
 	z-index: 2;
 	pointer-events: none;
@@ -447,6 +471,19 @@ li.sub-card-li {
 	filter: none;
 }
 
+/* Tier-colored bit gem inside the cheer description ("Cheered 100 <gem>").
+   22px tall to match the description's text box; width stays auto so the
+   narrower purple gem keeps its aspect. 1px gap to the text on its left. */
+.sub-bit-gem-icon {
+	height: 22px;
+	width: auto;
+	margin-left: 1px;
+	/* Gem box (22px) and the text's line box (~22px) are the same height, so
+	   top-aligning them = zero vertical offset, matching Figma. `middle` would
+	   center on the x-height and sit the gem visibly low. */
+	vertical-align: top;
+}
+
 /* ===== Follow alert (single centered row inside the boiling border) ===== */
 .follow-card-content {
 	align-items: center;
@@ -466,7 +503,7 @@ li.sub-card-li {
 	font-weight: 600;
 	color: #000000;
 	margin-left: 4px;
-	margin-right: 10px;
+	margin-right: 3px;   /* 3px gap to the timestamp, matching the other cards */
 	flex-shrink: 0;
 }
 
@@ -542,10 +579,12 @@ a {
 	display: flex;
 	flex-direction: row;
 	align-items: center;
-	max-width: 380px;
 	min-width: 0;
 	overflow: visible;
-	flex-shrink: 1;
+	/* Fill the row up to a fixed 3px gap before the timestamp, so the scrolling
+	   username window ends exactly 3px from it — never a larger gap. */
+	flex: 1 1 auto;
+	margin-right: 6px;
 }
 
 .sub-user-content #username {
@@ -572,11 +611,14 @@ a {
 }
 
 #gift-receiver {
-	display: none;         
+	display: none;
 	align-items: center;
 	flex-shrink: 1;
 	min-width: 0;
-	overflow: hidden;      
+	/* overflow:visible — the receiver name's .mq self-clips (overflow-x:clip) and
+	   fades via its mask. A hard overflow:hidden here defeated that child mask,
+	   so the right edge rendered as a hard clip instead of the fade. */
+	overflow: visible;
 }
 
 .gift-arrow-spacer {
@@ -662,6 +704,13 @@ a {
     overflow: hidden;
     text-overflow: ellipsis;
     line-height: 1.1;
+    /* The marquee fade mask clips to the border box; this tight line-height lets glyph
+       descenders (g, y, j) ink just past the box bottom, so they'd get sheared off when
+       the title overflows and the mask kicks in. padding-block gives the box a few px of
+       vertical room to contain that ink; the negative margin-block cancels it so the
+       card's spacing is unchanged. (Vertical only — the horizontal edge fade is untouched.) */
+    padding-block: 4px;
+    margin-block: -4px;
 }
 
 .music-ui-album {
@@ -690,6 +739,7 @@ a {
     overflow: hidden;
     white-space: nowrap;
     flex-shrink: 1;
+    min-width: 0;
 }
 
 .music-ui-duration {
@@ -703,4 +753,43 @@ a {
     width: 18px;
     height: 18px;
     object-fit: contain;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Scrolling marquee windows (ported from collage.html). These replace the
+   old "…" text-overflow: ellipsis treatment on gift-sub names and on the
+   song-request song info. Defined last so .mq's overflow wins over the
+   ellipsis rules on .music-ui-title / .music-ui-album / .music-ui-artist.
+   ═══════════════════════════════════════════════════════════════════ */
+.mq { overflow-x: clip; overflow-y: visible; }
+.mq-inner { display: inline-block; vertical-align: top; white-space: nowrap; will-change: transform; }
+
+/* The soft edge fade is a mask gradient driven INLINE from JS (mqApplyFade) — see
+   the note there for why (a registered @property inside a mask calc() doesn't
+   repaint reliably across stacked cards). This rule only fixes the repeat. */
+.mq.fade { -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat; }
+
+/* Username fade-scroll window: replaces the old "…" ellipsis truncation. Shrinks
+   within its flex row so it only scrolls when the name would overflow. */
+.name-mq { font-weight: 600; font-size: 1em; flex-shrink: 1; min-width: 0; }
+
+/* ── Gift-sub two-name row (sender name ↔ receiver name share the width) ── */
+/* fill + 3px timestamp gap come from the base .sub-user-content rule above. */
+.sub-user-content.is-gift #gift-receiver {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.gift-sender {
+    display: flex;
+    align-items: center;
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.gift-name {
+    font-weight: 600;
+    font-size: 1em;
+    flex: 1 1 0;
+    min-width: 0;
 }

@@ -14,7 +14,13 @@ function getParentUrl() {
 }
 
 function buildQueryString() {
-    return settings.map(s => `${encodeURIComponent(s.id)}=${encodeURIComponent(values[s.id])}`).join('&');
+    return settings
+        // Settings flagged omitWhenDefault are left out of the URL while at their
+        // default, so links stay backward-compatible (e.g. ?stingers is only added
+        // once it's turned on).
+        .filter(s => !(s.omitWhenDefault && String(values[s.id]) === String(s.defaultValue)))
+        .map(s => `${encodeURIComponent(s.id)}=${encodeURIComponent(values[s.id])}`)
+        .join('&');
 }
 
 function getWidgetUrl() {
