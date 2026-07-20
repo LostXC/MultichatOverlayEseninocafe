@@ -560,18 +560,17 @@ async function TwitchChatMessage(data) {
    to the copies in the stinger's script.js. If you change these, change both.
    ========================================================================= */
 const STINGER_SYNC = {
-  chatFadeMs:    350,   // chat fade out / fade in (matches #mainContainer transition in style.css)
-  stingerFadeMs: 300,   // the stinger source's own fade in/out
+  chatFadeMs:     350,  // chat fade out / fade in (matches #mainContainer transition in style.css)
   // --- tip-jar timing model, mirrors the stinger's CFG so we can predict a cheer's length ---
   fps:            25,
   jarIntroFrames: 36,   // the jar-rise intro
   throwStaggerMs: 170,  // gap between queued gem throws
   throwFlightMs:  780,  // a gem's flight time
+  noteTailMs:     850,  // the last note lingers after the last gem lands
+  jarIdleMs:      800,  // the jar/sub holds this long before it starts fading out
   maxThrows:      40,   // the jar clamps a cheer to this many throws
-  cheerTailMs:    900,  // settle + hold the full jar after the last gem
   subFrames:      65,   // sub-stinger frame count
-  subHoldMs:      550,  // hold the last sub frame before fading
-  bufferMs:       300,  // safety pad so the chat never fades in before the stinger is done
+  marginMs:       250,  // small pad so the chat's card lands as the stinger clears, not before
 };
 
 // mirrors CFG.bitTiers decomposition in the stinger — how many gems a cheer throws
@@ -583,16 +582,17 @@ function stingerCheerThrows(bits) {
   return Math.min(n, STINGER_SYNC.maxThrows);
 }
 
-// On-screen time (ms) the stinger needs for an event — identical to the stinger's copy.
+// Predicted on-screen time (ms) the stinger runs for an event — identical to the
+// stinger's copy so the chat fades back in as the stinger clears.
 function stingerContentMs(kind, data) {
   const S = STINGER_SYNC;
   if (kind === 'cheer') {
     const n = stingerCheerThrows(data && data.bits);
     const introMs  = S.jarIntroFrames / S.fps * 1000;
     const throwsMs = (n - 1) * S.throwStaggerMs + S.throwFlightMs;
-    return Math.round(introMs + throwsMs + S.cheerTailMs + S.bufferMs);
+    return Math.round(introMs + throwsMs + S.noteTailMs + S.jarIdleMs + S.marginMs);
   }
-  return Math.round(S.subFrames / S.fps * 1000 + S.subHoldMs + S.bufferMs);
+  return Math.round(S.subFrames / S.fps * 1000 + S.jarIdleMs + S.marginMs);
 }
 
 let stingerCycleEndAt = 0;   // performance.now() when the held cards are released
