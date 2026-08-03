@@ -22,6 +22,13 @@ const showBadges = GetBooleanParam("showBadges", true);
 const showUsername = GetBooleanParam("showUsername", true);
 const showMessage = GetBooleanParam("showMessage", true);
 const showTopGradient = GetBooleanParam("showTopGradient", true);
+// Word-by-word reveal on message bodies (see writeInMessage). On by default so
+// existing browser-source URLs pick it up; add ?writingAnimation=false to turn it
+// off, which is worth doing if the streaming machine is running hot.
+const writingAnimation = GetBooleanParam("writingAnimation", true);
+// How often the boiling border redraws. Hand-inked boil is shot on twos, so 12 is
+// both the more faithful look and a fifth of the rasterising the old 60 asked for.
+const boilFps = Math.max(1, Math.min(60, GetIntParam("boilFps") || 12));
 
 const font = urlParams.get("font") || "";
 const fontSize = urlParams.get("fontSize") || "18";
@@ -234,8 +241,7 @@ async function renderFeaturedMessage(data, headerText, platform) {
 	instance.querySelector("#timestamp").innerText = GetCurrentTimeFormatted();
 
 	const usernameSpan = instance.querySelector("#username");
-	usernameSpan.innerText = data.user.name;
-	usernameSpan.style.color = tameUsernameColor(platform === 'twitch' ? '#A644FF' : '#FF0000');
+	usernameSpan.replaceWith(usernameMarquee(data.user.name, tameUsernameColor(platform === 'twitch' ? '#A644FF' : '#FF0000')));
 
 	if (data.user.name !== 'Anonymous') {
 		const avatarUrl = await GetAvatar(data.user.name, data.user.profileImageUrl, platform);
@@ -474,9 +480,11 @@ async function TwitchChatMessage(data) {
 	if (showTimestamps) instance.querySelector("#timestamp").innerText = GetCurrentTimeFormatted();
 
 	if (showUsername) {
+		// Same fade-scroll window the event cards use — a long display name is
+		// cropped and scrolled instead of running off the row and shoving the
+		// timestamp out of view.
 		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.innerText = data.message.displayName;
-		usernameDiv.style.color = usernameChatColor(data.message.color);
+		usernameDiv.replaceWith(usernameMarquee(data.message.displayName, usernameChatColor(data.message.color)));
 	}
 
 	const messageDiv = instance.querySelector("#message");
@@ -920,8 +928,7 @@ async function YouTubeMessage(data) {
 
 	if (showUsername) {
 		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.innerText = data.user.name;
-		usernameDiv.style.color = usernameChatColor('#f70000');
+		usernameDiv.replaceWith(usernameMarquee(data.user.name, usernameChatColor('#f70000')));
 	}
 
 	const messageDiv = instance.querySelector("#message");
@@ -1129,8 +1136,7 @@ async function KickChatMessage(data) {
 
 	if (showUsername) {
 		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.innerText = data.user.name;
-		usernameDiv.style.color = usernameChatColor(data.user.color || '#53FC18');
+		usernameDiv.replaceWith(usernameMarquee(data.user.name, usernameChatColor(data.user.color || '#53FC18')));
 	}
 
 	const messageDiv = instance.querySelector("#message");
@@ -1224,8 +1230,7 @@ async function TikTokChat(data) {
 
 	if (showUsername) {
 		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.innerText = data.nickname;
-		usernameDiv.style.color = usernameChatColor('#FF0050');
+		usernameDiv.replaceWith(usernameMarquee(data.nickname, usernameChatColor('#FF0050')));
 	}
 
 	const messageDiv = instance.querySelector("#message");
@@ -1329,19 +1334,130 @@ function boilTraceSmoothPath(c, pts) {
 	for (let i=0; i<pts.length; i++) { p1 = pts[i]; const p2 = pts[(i+1)%pts.length]; c.quadraticCurveTo(p1.x, p1.y, (p1.x+p2.x)/2, (p1.y+p2.y)/2); }
 	c.closePath();
 }
+/* Off-screen culling for the boiling borders. The message list holds up to 5×
+   the viewport height of cards, so most of the borders that are animating are
+   scrolled outside the browser source and nobody can see them boil. This
+   observer flags which canvases actually intersect the viewport; the tick below
+   skips the noise + path work for the rest. The boil is driven by absolute time
+   (ts/1000), so a culled border picks straight back up in phase — it never
+   "restarts" — and cards only ever scroll away from the visible area anyway. */
+const boilVisibility = new IntersectionObserver(entries => {
+	for (const e of entries) {
+		// A card only becomes cullable once it has actually been on screen. While a
+		// card is playing its 0.4s height grow-in it is clipped to a zero-height box,
+		// which reads as "not intersecting" — without this gate the border would sit
+		// blank for the whole entrance. Cards only ever drift away from the visible
+		// area afterwards, so in practice this costs nothing.
+		if (e.isIntersecting) { e.target._boilVisible = true; e.target._boilSeen = true; }
+		else if (e.target._boilSeen) e.target._boilVisible = false;
+	}
+}, { rootMargin: '120px' });   // margin so a card is already boiling before it slides into view
+
+/* How long a border has to stay off screen before its pixels are handed back.
+   A card's backing store is ~0.6-0.8 MB (two of them on a card with a comment),
+   and a busy hour's worth of cards sitting in the list adds up to tens of MB of
+   canvas that nothing can see. The delay is hysteresis: a card that is merely
+   grazing the cull boundary shouldn't churn its buffer. */
+const BOIL_RELEASE_AFTER_MS = 2000;
+
+/* The boil holds still while the card animates in.
+
+   Redrawing the border costs the same in script whatever size the card is — the
+   path is always 560 points — but the browser still has to rasterise the whole
+   canvas each frame, and THAT scales with the card's area. A six-line comment is
+   303k pixels against 131k for a one-line one, so a tall card was asking for more
+   than twice the per-frame raster at the exact moment the list is also relaying
+   out for the height transition and the body's words are animating in. That's why
+   the hitch got worse the more lines a card had.
+
+   So: paint the border once and hold that frame until the card has settled, then
+   start boiling. The noise clock is rewound when it starts so the shape continues
+   from the held frame rather than jumping to wherever the boil would have been —
+   and since the card is clipping into view for that whole window, a border that
+   starts wobbling half a second later is not something you can see. */
+const BOIL_HOLD_ON_APPEAR_MS = 650;   // covers the 0.5s height + content transitions
+const BOIL_FRAME_MS = 1000 / boilFps; // gap between redraws once a card has settled
+
 function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 	const P = BOIL_CFG.padding, R = BOIL_CFG.cornerRadius, cw = contentW + P*2, ch = contentH + P*2 + bottomExtension;
-	canvas.width = cw * dpr; canvas.height = ch * dpr;
 	canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
-	const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+	const ctx = canvas.getContext('2d');
+	// Sizing a canvas allocates its backing store and resets the context state, so
+	// the dpr scale has to be re-applied every time — on first use and again if the
+	// buffer was released while off screen and the card comes back into view.
+	let sized = false;
+	function sizeCanvas() {
+		canvas.width = cw * dpr; canvas.height = ch * dpr;
+		ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
+		sized = true;
+	}
+	function releaseCanvas() {
+		canvas.width = 0; canvas.height = 0;   // hands the pixels back to the browser
+		sized = false;
+	}
 	const basePath = boilBuildBasePath(contentW, contentH + bottomExtension, R), seed = Math.random() * 1000;
-	function tick(ts) {
+	canvas._boilVisible = true;          // assume visible until the observer has seen it on screen
+	canvas._boilSeen = false;
+	boilVisibility.observe(canvas);
+	sizeCanvas();
+	let culledAt = 0;
+	function drawBoil(tSec) {
 		ctx.clearRect(0, 0, cw, ch); ctx.save(); ctx.translate(P, P);
-		const deformed = boilDeformPath(basePath, ts / 1000, seed);
+		const deformed = boilDeformPath(basePath, tSec, seed);
 		ctx.fillStyle = '#ffffff'; boilTraceSmoothPath(ctx, deformed); ctx.fill();
 		ctx.strokeStyle = '#000000'; ctx.lineWidth = BOIL_CFG.strokeWidth; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
 		boilTraceSmoothPath(ctx, deformed); ctx.stroke();
-		ctx.restore(); requestAnimationFrame(tick);
+		ctx.restore();
+	}
+	let firstTs = 0, heldFrameDrawn = false, boilTimeOffset = 0, lastBoilDraw = -1e9;
+	function tick(ts) {
+		// The card this canvas belonged to was removed (hideAfter, or the message
+		// list pruning its top). Stop the loop and let it be collected — without
+		// this the border kept boiling into a detached canvas for the rest of the
+		// session, and every card ever shown left one behind.
+		if (!canvas.isConnected) { boilVisibility.unobserve(canvas); return; }
+		if (!canvas._boilVisible) {                       // scrolled out of the source
+			if (!culledAt) culledAt = ts;
+			else if (sized && ts - culledAt > BOIL_RELEASE_AFTER_MS) releaseCanvas();
+			requestAnimationFrame(tick);
+			return;
+		}
+		culledAt = 0;
+		// Came back into view: the buffer was handed back, so it is empty and has to
+		// be repainted on this frame rather than waiting for the next boil tick.
+		if (!sized) { sizeCanvas(); heldFrameDrawn = false; lastBoilDraw = -1e9; }
+		if (!firstTs) firstTs = ts;
+
+		if (ts - firstTs < BOIL_HOLD_ON_APPEAR_MS) {
+			// Card is still animating in: one frame, then hold it.
+			if (!heldFrameDrawn) { drawBoil(firstTs / 1000); heldFrameDrawn = true; }
+			requestAnimationFrame(tick);
+			return;
+		}
+		// Settled. Rewind the clock so the motion picks up exactly where the held
+		// frame left off instead of snapping to a new shape. Nothing is drawn on
+		// this frame — the held one is already the right shape for this instant.
+		if (!boilTimeOffset) {
+			boilTimeOffset = ts - firstTs;
+			lastBoilDraw = ts;
+			requestAnimationFrame(tick);
+			return;
+		}
+		// Boiling, on twos. The loop still runs every frame — it costs a couple of
+		// comparisons and keeps the cull and release checks responsive — but the
+		// canvas, which is the part that actually has to be rasterised, only
+		// repaints boilFps times a second.
+		if (ts - lastBoilDraw < BOIL_FRAME_MS) { requestAnimationFrame(tick); return; }
+		// Step the deadline on a fixed grid rather than resetting it to now. A
+		// display frame almost never lands exactly on the interval, so resetting to
+		// now pushes the next deadline a fraction late, that fraction compounds, and
+		// every so often a whole frame gets skipped — 12fps drifts to 11 and the
+		// wobble stutters unevenly. Stepping by the interval keeps the beat true.
+		// The jump back to `ts` resyncs after a real stall (source hidden, long frame)
+		// instead of trying to catch up on a burst of missed draws.
+		lastBoilDraw = (ts - lastBoilDraw > 2 * BOIL_FRAME_MS) ? ts : lastBoilDraw + BOIL_FRAME_MS;
+		drawBoil((ts - boilTimeOffset) / 1000);
+		requestAnimationFrame(tick);
 	}
 	requestAnimationFrame(tick);
 }
@@ -1430,17 +1546,36 @@ function mqSetEdgeFade(m, off) {   // off ≤ 0; grows the left / right fade wit
 	mqApplyFade(m, l, r);
 }
 
+/* Transform / opacity are re-written every frame while a line is moving, but a
+   marquee spends most of its cycle parked (the 2s rest at home, the hold at the
+   end, and the whole of every non-overflowing line). Remembering the last value
+   written skips the style write — and, for opacity, the toFixed() allocation —
+   for those stretches. Rounding the offset to 1/100 px also lets the tail of an
+   ease, where consecutive frames differ by far less than that, settle instead of
+   writing a new transform for motion nobody can see. */
+function mqSetTransform(m, off) {
+	const v = Math.round(off * 100) / 100;
+	if (v === m._off) return;
+	m._off = v;
+	m.inner.style.transform = `translateX(${v}px)`;
+}
+function mqSetOpacity(m, op) {
+	if (op === m._op) return;
+	m._op = op;
+	m.inner.style.opacity = op.toFixed(3);
+}
+
 function mqTickSmooth(m, t) {
-	if (m.O <= 0) { m.inner.style.transform = 'translateX(0)'; mqApplyFade(m, 0, 0); return; }
+	if (m.O <= 0) { mqSetTransform(m, 0); mqApplyFade(m, 0, 0); return; }
 	const tt = t % m.group.cycle;
 	const off = tt < MQ.pauseStart ? 0 : -mqTravel(m.unit, tt - MQ.pauseStart);
-	m.inner.style.transform = `translateX(${off}px)`;
+	mqSetTransform(m, off);
 	const d = Math.min(-off, m.unit + off);   // distance from the nearest home edge
 	mqApplyFade(m, Math.max(0, Math.min(1, d / MQ.fadePx)), 1);   // wrapped copy always overflows the right
 }
 
 function mqTickFadeswap(m, t) {
-	if (m.O <= 0) { m.inner.style.transform = 'translateX(0)'; m.inner.style.opacity = 1; mqSetEdgeFade(m, 0); return; }
+	if (m.O <= 0) { mqSetTransform(m, 0); mqSetOpacity(m, 1); mqSetEdgeFade(m, 0); return; }
 	const tt = t % m.group.cycle;
 	const s0 = MQ.pauseStart, s1 = s0 + m.group.scrollDur, s2 = s1 + MQ.holdEnd, s3 = s2 + MQ.fadeMs, s4 = s3 + MQ.homeHold;
 	let off = 0, op = 1;
@@ -1450,31 +1585,49 @@ function mqTickFadeswap(m, t) {
 	else if (tt < s3) { off = -m.O; op = 1 - (tt - s2) / MQ.fadeMs; }         // fade out
 	else if (tt < s4) { off = 0;  op = 0; }                                   // reset home, hidden
 	else              { off = 0;  op = Math.min(1, (tt - s4) / MQ.fadeMs); }  // fade in
-	m.inner.style.transform = `translateX(${off}px)`;
-	m.inner.style.opacity = op.toFixed(3);
+	mqSetTransform(m, off);
+	mqSetOpacity(m, op);
 	mqSetEdgeFade(m, off);
 }
 
 function mqTickPark(m, t) {
 	const off = (m.O > 0 && t > MQ.pauseStart) ? -mqTravel(m.O, t - MQ.pauseStart) : 0;
-	m.inner.style.transform = `translateX(${off}px)`; mqSetEdgeFade(m, off);
+	mqSetTransform(m, off); mqSetEdgeFade(m, off);
 }
+
+function mqTick(m, t) {
+	switch (m.mode) {
+		case 'smooth':   mqTickSmooth(m, t); break;
+		case 'fadeswap': mqTickFadeswap(m, t); break;
+		default:         mqTickPark(m, t); break;
+	}
+}
+
+// The loop only runs while something is actually scrolling — see mqEnsureRunning.
+let mqRunning = false;
 
 function mqLoop(now) {
 	for (let i = mqActive.length - 1; i >= 0; i--) {
 		const m = mqActive[i];
 		if (!m.win.isConnected) { mqActive.splice(i, 1); continue; }   // card was removed → drop it
 		if (!m.group || !m.group.ready) continue;
-		const t = now - m.group.t0;
-		switch (m.mode) {
-			case 'smooth':   mqTickSmooth(m, t); break;
-			case 'fadeswap': mqTickFadeswap(m, t); break;
-			default:         mqTickPark(m, t); break;
-		}
+		mqTick(m, now - m.group.t0);
+		// A line that fits its window never moves: overflow is measured once, so
+		// after the single tick that puts it in its resting state there is nothing
+		// left to animate. Most usernames fit, so this retires the large majority
+		// of marquees instead of re-writing the same styles for them every frame.
+		if (m.O <= 0) mqActive.splice(i, 1);
 	}
+	if (mqActive.length) requestAnimationFrame(mqLoop);
+	else mqRunning = false;   // idle overlay → no loop at all until the next card
+}
+// Started on demand by startCardMarquees so an overlay with no scrolling text
+// costs nothing per frame.
+function mqEnsureRunning() {
+	if (mqRunning) return;
+	mqRunning = true;
 	requestAnimationFrame(mqLoop);
 }
-requestAnimationFrame(mqLoop);
 
 /* Gift-sub two-name width sharing (max-min fairness), ported from collage.html:
      both fit        → each takes exactly what it needs (no scroll)
@@ -1538,9 +1691,77 @@ function startCardMarquees(root) {
 	group.fadeTail = hasFade ? (MQ.holdEnd + MQ.fadeMs + MQ.homeHold + MQ.fadeMs) : 0;
 	group.cycle = MQ.pauseStart + group.scrollDur + group.fadeTail;
 	group.ready = true;
+	mqEnsureRunning();
 }
 
-function AddMessageItem(element, elementID, platform, userId, customClasses = [], onAdded = null) {
+/* ════════════════════════════════════════════════════════════════
+   Word-by-word reveal for message bodies.
+
+   NOT a typewriter, deliberately. AddMessageItem measures the finished message
+   in a hidden container and then animates the line's height from 0 to that
+   measured value, so text that grows as it "types" would re-wrap underneath a
+   height measured for the finished text and the box would be wrong for most of
+   the reveal. This is paint-only instead: the message is fully laid out from the
+   first frame and each word just fades and rises into place.
+
+   Keeping it layout-neutral is what the splitting below is careful about:
+     · runs of whitespace stay as raw text nodes, so line breaking is untouched
+     · a word becomes an inline-block, which changes nothing — a word was already
+       the unit a line breaks on
+     · an emote <img> reveals as one unit rather than being descended into
+     · .mq subtrees are left alone: those are the scrolling marquee windows, and
+       their widths have just been measured by startCardMarquees
+   ════════════════════════════════════════════════════════════════ */
+const WRITE = { step: 34, total: 420 };   // per-word stagger, and the cap on the whole reveal
+
+// Replace text nodes with per-word spans, collecting them in document order.
+function writeCollectWords(node, out) {
+	for (const kid of Array.from(node.childNodes)) {
+		if (kid.nodeType === Node.TEXT_NODE) {
+			const frag = document.createDocumentFragment();
+			for (const part of kid.data.split(/(\s+)/)) {      // keeps the separators
+				if (!part) continue;
+				if (/^\s+$/.test(part)) { frag.appendChild(document.createTextNode(part)); continue; }
+				const w = document.createElement('span');
+				w.className = 'write-word';
+				w.textContent = part;
+				frag.appendChild(w);
+				out.push(w);
+			}
+			node.replaceChild(frag, kid);
+		} else if (kid.nodeType === Node.ELEMENT_NODE) {
+			if (kid.classList.contains('mq')) continue;                                  // scrolling window — leave it be
+			if (kid.tagName === 'IMG') { kid.classList.add('write-word'); out.push(kid); }  // emote = one unit
+			else writeCollectWords(kid, out);
+		}
+	}
+}
+
+// Long messages tighten their step rather than taking seconds to become readable.
+function writeInElement(el) {
+	if (!el) return;
+	const words = [];
+	writeCollectWords(el, words);
+	if (!words.length) return;
+	el.classList.add('write-in');
+	const step = Math.min(WRITE.step, WRITE.total / words.length);
+	words.forEach((w, i) => { w.style.animationDelay = Math.round(i * step) + 'ms'; });
+}
+
+// The message bodies that get the reveal. Event-card headers ("Subscribed With
+// Tier 1") are left alone — they're short labels, not something being said.
+function writeInMessage(root) {
+	if (!writingAnimation) return;
+	writeInElement(root.querySelector('#message'));
+	writeInElement(root.querySelector('.featured-message-text'));
+	writeInElement(root.querySelector('.sub-comment-text'));
+}
+
+// onMeasured runs in the hidden measure pass, while the card is laid out but not
+// yet on screen; onAdded runs on the frame it starts animating in. Anything with a
+// one-off setup cost belongs in onMeasured, so the cost doesn't land on the same
+// frame as the appear.
+function AddMessageItem(element, elementID, platform, userId, customClasses = [], onAdded = null, onMeasured = null) {
 	const tempContainer = document.createElement('div');
 	tempContainer.style.cssText = `position:absolute; visibility:hidden; width:${BASE_WIDTH}px; pointer-events:none;`;
 	
@@ -1557,7 +1778,13 @@ function AddMessageItem(element, elementID, platform, userId, customClasses = []
 
 	setTimeout(function () {
 		const calculatedHeight = tempLi.offsetHeight + "px";
-		
+
+		// Still hidden here, and the layout the measurement above needed is already
+		// done — the cheapest moment to do any heavy per-card setup. The children are
+		// moved into the real line below without ever leaving the document, so a
+		// canvas warmed here keeps its pixels.
+		if (onMeasured) onMeasured(tempLi);
+
 		const lineItem = document.createElement('li');
 		lineItem.id = elementID;
 		lineItem.dataset.platform = platform;
@@ -1578,6 +1805,14 @@ function AddMessageItem(element, elementID, platform, userId, customClasses = []
 				lineItem.classList.add("show");
 				lineItem.style.height = calculatedHeight;
 				if (onAdded) onAdded(lineItem);
+				// Every line, not just event cards: plain chat usernames are fade-scroll
+				// windows too, and they need measuring once they're in the real layout.
+				// startCardMarquees no-ops on a line that contains no .mq window.
+				startCardMarquees(lineItem);
+				// Split the body into words on the same frame the line starts opening,
+				// so both animations run off one clock. After the marquees, so their
+				// widths are measured on untouched markup.
+				writeInMessage(lineItem);
 			});
 		});
 
@@ -1601,7 +1836,15 @@ function AddMessageItem(element, elementID, platform, userId, customClasses = []
 }
 
 function AddSubCardItem(element, elementID, platform, userId) {
-	AddMessageItem(element, elementID, platform, userId, ['sub-card-li'], (li) => {
+	// The borders are set up in the measure pass, not on the frame the card appears.
+	// Sizing a canvas allocates a backing store — ~0.6-0.8 MB each here, and a card
+	// with a comment has two — and doing that plus the first noise draw on the same
+	// frame the line starts opening is what made bordered cards hitch on their way
+	// in. By the time the card is shown its pixels already exist and are painted.
+	//
+	// The scrolling name / song-info marquees stay in the shown pass: they measure
+	// text against the real layout, which the hidden pass can't stand in for.
+	AddMessageItem(element, elementID, platform, userId, ['sub-card-li'], null, (li) => {
 		const tryInitBorder = (canvas, wrapper, extension, retries = 5) => {
 			if (!canvas || !wrapper) return;
 			const w = wrapper.offsetWidth, h = wrapper.offsetHeight;
@@ -1617,10 +1860,6 @@ function AddSubCardItem(element, elementID, platform, userId) {
 
 		const commentCanvas = li.querySelector('.sub-comment-border-canvas');
 		if (commentCanvas && commentWrapperEl && commentWrapperEl.style.display !== 'none') tryInitBorder(commentCanvas, commentWrapperEl, 0);
-
-		// Measure + start any scrolling name / song-info marquees now that the card
-		// is in the real layout (gift sender+receiver names, song-request info).
-		startCardMarquees(li);
 	});
 }
 

@@ -95,9 +95,43 @@ li {
 	border: none !important;
 	box-shadow: none !important;
 	border-radius: 0 !important;
-	transition: height 0.4s ease-out, opacity 0.4s ease-out;
+	transition: height 0.5s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.4s ease-out;
 	will-change: height, opacity;
-	width: var(--width); 
+	width: var(--width);
+}
+
+/* ── Appear ──────────────────────────────────────────────────────────
+   The line's height opens up to make room in the list; the message inside
+   rises into that space and fades in at the same time, so it settles rather
+   than being scraped into view by the clipping edge. Both use the same
+   soft-landing curve (fast start, long gentle finish) as the marquee eases,
+   with the fade running slightly shorter so it's fully opaque just before
+   the motion stops. Selector is #messageList-scoped so it outranks the id
+   rules on the containers it animates. */
+#messageList li > * {
+	opacity: 0;
+	transform: translateY(10px) translateZ(0);
+	transition: opacity 0.34s ease-out,
+	            transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+#messageList li.show > * {
+	opacity: 1;
+	transform: translateY(0) translateZ(0);
+}
+
+/* ── Word-by-word reveal ─────────────────────────────────────────────
+   Applied by writeInMessage() in script.js, which splits the body into
+   .write-word units and writes each one's animation-delay. Inline-block is
+   safe here: a word was already the unit a line breaks on, so making it
+   atomic leaves the wrap — and therefore the line height the list measured
+   before showing it — exactly as it was. */
+.write-in .write-word {
+	display: inline-block;
+	animation: writeWordIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes writeWordIn {
+	from { opacity: 0; transform: translateY(6px); }
+	to   { opacity: 1; transform: translateY(0); }
 }
 
 .reverseLineItemDirection {
