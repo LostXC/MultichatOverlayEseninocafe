@@ -26,9 +26,10 @@ const showTopGradient = GetBooleanParam("showTopGradient", true);
 // existing browser-source URLs pick it up; add ?writingAnimation=false to turn it
 // off, which is worth doing if the streaming machine is running hot.
 const writingAnimation = GetBooleanParam("writingAnimation", true);
-// How often the boiling border redraws. Hand-inked boil is shot on twos, so 12 is
-// both the more faithful look and a fifth of the rasterising the old 60 asked for.
-const boilFps = Math.max(1, Math.min(60, GetIntParam("boilFps") || 12));
+// How often the boiling border redraws. 24 is the tuned value and no longer a
+// setting — the settings page doesn't offer it. ?boilFps=N is still read, so older
+// URLs that pinned a rate keep it, and it stays available for testing.
+const boilFps = Math.max(1, Math.min(60, GetIntParam("boilFps") || 24));
 
 const font = urlParams.get("font") || "";
 const fontSize = urlParams.get("fontSize") || "18";
