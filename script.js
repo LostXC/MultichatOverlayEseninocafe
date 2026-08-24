@@ -26,10 +26,37 @@ const showTopGradient = GetBooleanParam("showTopGradient", true);
 // existing browser-source URLs pick it up; add ?writingAnimation=false to turn it
 // off, which is worth doing if the streaming machine is running hot.
 const writingAnimation = GetBooleanParam("writingAnimation", true);
-// How often the boiling border redraws. 24 is the tuned value and no longer a
-// setting — the settings page doesn't offer it. ?boilFps=N is still read, so older
-// URLs that pinned a rate keep it, and it stays available for testing.
-const boilFps = Math.max(1, Math.min(60, GetIntParam("boilFps") || 24));
+/* ── Boil feel: two separate knobs ──────────────────────────────────────────
+   boilFps  — how OFTEN the border is redrawn.
+   boilStep — how DIFFERENT each redraw is from the one before it.
+
+   These used to be the same knob, which is why the line looked like it was
+   moving rather than being redrawn. The noise clock was wall time, so between
+   two drawn frames the field advanced by noiseTimeScale/boilFps ≈ 0.04 — and 3D
+   simplex decorrelates over roughly 1.0 of z, so each "new" drawing was a 4%
+   nudge of the last one. Lowering boilFps alone just made that same smooth drift
+   chug; it never got sketchier, because the shapes were still nearly identical.
+
+   Driving the noise off the drawing COUNT instead of the clock separates them: a
+   step of about 0.5 gives a fully independent drawing every time. Measured on
+   these cards, 0.042 moves each point 0.14px between drawings; 0.178 moves it
+   about 0.6px, roughly half of the distance two unrelated drawings sit apart —
+   enough that each one reads as redrawn, close enough that they still look like
+   the same hand drew them. Past ~0.5 there is nothing left to gain.
+
+   Time is quantised to the drawing grid, so every boiling outline in the scene
+   changes on the same beat — the way everything on an animator's sheet updates
+   on the same frame — and the same expression gives both the noise coordinate
+   and the redraw throttle: if the index has not moved, there is nothing new to
+   draw.
+
+   Shape is untouched: noiseAmp stays 1.5, so the card silhouette is the same as
+   before. This changes how the line is *redrawn*, not how far it wanders.
+   ?boilAmp=N raises the wander if you want it rougher still.
+
+   To get the old smooth drift back exactly: ?boilFps=24&boilStep=0.042           */
+const boilFps = Math.max(1, Math.min(60, GetIntParam("boilFps") || 7));
+const boilStep = Math.max(0, Math.min(4, GetFloatParam("boilStep") ?? 0.178));
 
 const font = urlParams.get("font") || "";
 const fontSize = urlParams.get("fontSize") || "18";
@@ -1314,6 +1341,9 @@ const Simplex3D = (function () {
 })();
 
 const BOIL_CFG = { cornerRadius: 20, strokeWidth: 7, noiseFreq: 4.2, noiseCoordScale: 0.006, noiseTimeScale: 1.0, noiseAmp: 1.5, divW: 200, divH: 60, divCorner: 10, padding: 10 };
+// How far the line wanders off true. Capped at 4: the card sits inside 10px of
+// padding and the stroke eats 3.5 of it, so past ~6 the outline would clip.
+BOIL_CFG.noiseAmp = Math.max(0, Math.min(4, GetFloatParam("boilAmp") ?? BOIL_CFG.noiseAmp));
 function boilBuildBasePath(W, H, R) {
 	const pts =[]; const { divW, divH, divCorner } = BOIL_CFG;
 	for (let i=0; i<divW; i++) pts.push({ x: R+(W-2*R)*(i/divW), y: 0 });
@@ -1326,14 +1356,35 @@ function boilBuildBasePath(W, H, R) {
 	for (let i=0; i<divCorner; i++) pts.push({ x: R+R*Math.cos(Math.PI+(Math.PI/2)*(i/divCorner)), y: R+R*Math.sin(Math.PI+(Math.PI/2)*(i/divCorner)) });
 	return pts;
 }
+/* One scratch array of points, shared by every border and rewritten in place on
+   each draw. The .map() this replaced built a fresh 560-object array every time —
+   per card, per draw — and threw it away as soon as the path was traced. The
+   points are consumed synchronously inside drawBoil before the next border gets
+   a look in, so a single buffer serves all of them. */
+const boilScratch = [];
 function boilDeformPath(base, time, seed) {
 	const freq = BOIL_CFG.noiseFreq * BOIL_CFG.noiseCoordScale, t = time * BOIL_CFG.noiseTimeScale;
-	return base.map(p => ({ x: p.x + Simplex3D(p.x*freq+seed, p.y*freq+seed, t) * BOIL_CFG.noiseAmp, y: p.y + Simplex3D(p.x*freq+seed+99.9, p.y*freq+seed+99.9, t) * BOIL_CFG.noiseAmp }));
+	const out = boilScratch, n = base.length;
+	if (out.length !== n) out.length = n;   // every base path is 560 points, but don't assume it
+	for (let i=0; i<n; i++) {
+		const p = base[i], o = out[i] || (out[i] = { x: 0, y: 0 });
+		o.x = p.x + Simplex3D(p.x*freq+seed, p.y*freq+seed, t) * BOIL_CFG.noiseAmp;
+		o.y = p.y + Simplex3D(p.x*freq+seed+99.9, p.y*freq+seed+99.9, t) * BOIL_CFG.noiseAmp;
+	}
+	return out;
 }
-function boilTraceSmoothPath(c, pts) {
-	if (pts.length < 3) return; c.beginPath(); let p1 = pts[0]; c.moveTo((pts[pts.length-1].x+p1.x)/2, (pts[pts.length-1].y+p1.y)/2);
-	for (let i=0; i<pts.length; i++) { p1 = pts[i]; const p2 = pts[(i+1)%pts.length]; c.quadraticCurveTo(p1.x, p1.y, (p1.x+p2.x)/2, (p1.y+p2.y)/2); }
-	c.closePath();
+/* Build the smoothed outline ONCE per draw and hand the same Path2D to the fill
+   and the stroke. Tracing straight into the context meant replaying all 560
+   quadraticCurveTo calls a second time to describe the identical shape that had
+   just been filled — the path is rebuilt from scratch after every beginPath(), so
+   the context had no way to know it was the same one. */
+function boilBuildSmoothPath(pts) {
+	const path = new Path2D();
+	if (pts.length < 3) return path;
+	let p1 = pts[0]; path.moveTo((pts[pts.length-1].x+p1.x)/2, (pts[pts.length-1].y+p1.y)/2);
+	for (let i=0; i<pts.length; i++) { p1 = pts[i]; const p2 = pts[(i+1)%pts.length]; path.quadraticCurveTo(p1.x, p1.y, (p1.x+p2.x)/2, (p1.y+p2.y)/2); }
+	path.closePath();
+	return path;
 }
 /* Off-screen culling for the boiling borders. The message list holds up to 5×
    the viewport height of cards, so most of the borders that are animating are
@@ -1377,7 +1428,22 @@ const BOIL_RELEASE_AFTER_MS = 2000;
    and since the card is clipping into view for that whole window, a border that
    starts wobbling half a second later is not something you can see. */
 const BOIL_HOLD_ON_APPEAR_MS = 650;   // covers the 0.5s height + content transitions
-const BOIL_FRAME_MS = 1000 / boilFps; // gap between redraws once a card has settled
+// Which drawing in the sequence `tSec` falls on, and where that drawing sits in
+// the noise field. Anchored to the page clock rather than a per-card counter so
+// all the borders on screen turn over together.
+const boilIndexAt = (tSec) => Math.floor(tSec * BOIL.fps);
+const boilZ = (idx) => idx * BOIL.step;
+/* Live handles, read fresh on every frame rather than closed over as constants.
+   That means the boil can be dialled from the console — or from the OBS browser
+   source's remote debugger — while cards are on screen, instead of reloading and
+   losing everything you were looking at. The URL params above just set the
+   starting values.  Try:  BOIL.step = 0.042   BOIL.fps = 8   BOIL.amp = 3       */
+window.BOIL = {
+	fps: boilFps,
+	step: boilStep,
+	get amp() { return BOIL_CFG.noiseAmp; },
+	set amp(v) { BOIL_CFG.noiseAmp = Math.max(0, Math.min(6, v)); },
+};
 
 function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 	const P = BOIL_CFG.padding, R = BOIL_CFG.cornerRadius, cw = contentW + P*2, ch = contentH + P*2 + bottomExtension;
@@ -1404,13 +1470,13 @@ function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 	let culledAt = 0;
 	function drawBoil(tSec) {
 		ctx.clearRect(0, 0, cw, ch); ctx.save(); ctx.translate(P, P);
-		const deformed = boilDeformPath(basePath, tSec, seed);
-		ctx.fillStyle = '#ffffff'; boilTraceSmoothPath(ctx, deformed); ctx.fill();
+		const path = boilBuildSmoothPath(boilDeformPath(basePath, tSec, seed));
+		ctx.fillStyle = '#ffffff'; ctx.fill(path);
 		ctx.strokeStyle = '#000000'; ctx.lineWidth = BOIL_CFG.strokeWidth; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-		boilTraceSmoothPath(ctx, deformed); ctx.stroke();
+		ctx.stroke(path);
 		ctx.restore();
 	}
-	let firstTs = 0, heldFrameDrawn = false, boilTimeOffset = 0, lastBoilDraw = -1e9;
+	let firstTs = 0, heldIdx = null, lastDrawnIdx = -1;
 	function tick(ts) {
 		// The card this canvas belonged to was removed (hideAfter, or the message
 		// list pruning its top). Stop the loop and let it be collected — without
@@ -1426,38 +1492,24 @@ function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 		culledAt = 0;
 		// Came back into view: the buffer was handed back, so it is empty and has to
 		// be repainted on this frame rather than waiting for the next boil tick.
-		if (!sized) { sizeCanvas(); heldFrameDrawn = false; lastBoilDraw = -1e9; }
+		// Came back into view with an empty buffer: forget what was drawn so the
+		// checks below repaint on this frame instead of waiting for the next beat.
+		if (!sized) { sizeCanvas(); heldIdx = null; lastDrawnIdx = -1; }
 		if (!firstTs) firstTs = ts;
 
+		// The card is still clipping into view. Put ONE drawing down and hold it —
+		// the boil starts once the card has arrived, not while it is sliding in.
 		if (ts - firstTs < BOIL_HOLD_ON_APPEAR_MS) {
-			// Card is still animating in: one frame, then hold it.
-			if (!heldFrameDrawn) { drawBoil(firstTs / 1000); heldFrameDrawn = true; }
+			if (heldIdx === null) { heldIdx = boilIndexAt(ts / 1000); drawBoil(boilZ(heldIdx)); }
 			requestAnimationFrame(tick);
 			return;
 		}
-		// Settled. Rewind the clock so the motion picks up exactly where the held
-		// frame left off instead of snapping to a new shape. Nothing is drawn on
-		// this frame — the held one is already the right shape for this instant.
-		if (!boilTimeOffset) {
-			boilTimeOffset = ts - firstTs;
-			lastBoilDraw = ts;
-			requestAnimationFrame(tick);
-			return;
-		}
-		// Boiling, on twos. The loop still runs every frame — it costs a couple of
-		// comparisons and keeps the cull and release checks responsive — but the
-		// canvas, which is the part that actually has to be rasterised, only
-		// repaints boilFps times a second.
-		if (ts - lastBoilDraw < BOIL_FRAME_MS) { requestAnimationFrame(tick); return; }
-		// Step the deadline on a fixed grid rather than resetting it to now. A
-		// display frame almost never lands exactly on the interval, so resetting to
-		// now pushes the next deadline a fraction late, that fraction compounds, and
-		// every so often a whole frame gets skipped — 12fps drifts to 11 and the
-		// wobble stutters unevenly. Stepping by the interval keeps the beat true.
-		// The jump back to `ts` resyncs after a real stall (source hidden, long frame)
-		// instead of trying to catch up on a burst of missed draws.
-		lastBoilDraw = (ts - lastBoilDraw > 2 * BOIL_FRAME_MS) ? ts : lastBoilDraw + BOIL_FRAME_MS;
-		drawBoil((ts - boilTimeOffset) / 1000);
+		// Arrived. Follow the shared beat. The loop still runs every frame — it is
+		// a couple of comparisons and it keeps the cull and release checks
+		// responsive — but the canvas, which is the part that has to be rasterised,
+		// only repaints when the drawing actually changes.
+		const idx = boilIndexAt(ts / 1000);
+		if (idx !== lastDrawnIdx) { lastDrawnIdx = idx; drawBoil(boilZ(idx)); }
 		requestAnimationFrame(tick);
 	}
 	requestAnimationFrame(tick);
@@ -1872,6 +1924,11 @@ function GetBooleanParam(paramName, defaultValue) {
 
 function GetIntParam(paramName) {
 	const val = parseInt(new URLSearchParams(window.location.search).get(paramName), 10);
+	return isNaN(val) ? null : val;
+}
+
+function GetFloatParam(paramName) {
+	const val = parseFloat(new URLSearchParams(window.location.search).get(paramName));
 	return isNaN(val) ? null : val;
 }
 
