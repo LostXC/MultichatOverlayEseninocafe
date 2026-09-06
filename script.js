@@ -260,6 +260,61 @@ function usernameChatColor(color) {
         : tameUsernameColor(color, USERNAME_LUM_MAX, USERNAME_LUM_MIN);
 }
 
+// Twitch only puts the chatter's chosen colour on chat messages — event payloads
+// (channel point redemptions, cheers, subs, raids, follows...) don't carry it, so the
+// bordered cards used to fall back to the platform purple. We remember every colour we
+// see go past in chat, keyed by user id / login / display name, and reuse it on that
+// user's cards. For someone who hasn't chatted yet we ask ivr.fi once (cached, and it
+// just falls back to the platform colour if the lookup fails).
+const twitchColorMap = new Map();
+const twitchColorFetches = new Map();
+
+function RememberTwitchColor(color, ...keys) {
+	if (!color || typeof color !== 'string' || !color.startsWith('#')) return;
+	keys.forEach(k => { if (k) twitchColorMap.set(String(k).toLowerCase(), color); });
+}
+
+function LookupTwitchColor(...keys) {
+	for (const k of keys) {
+		if (!k) continue;
+		const hit = twitchColorMap.get(String(k).toLowerCase());
+		if (hit) return hit;
+	}
+	return null;
+}
+
+function FetchTwitchColor(login) {
+	if (twitchColorFetches.has(login)) return twitchColorFetches.get(login);
+	const p = fetch('https://api.ivr.fi/v2/twitch/user?login=' + encodeURIComponent(login))
+		.then(r => r.ok ? r.json() : null)
+		.then(j => {
+			const hit = Array.isArray(j) ? j[0] : null;
+			const color = hit && hit.chatColor;
+			if (color) RememberTwitchColor(color, login, hit.id, hit.displayName);
+			return color || null;
+		})
+		.catch(() => null);
+	twitchColorFetches.set(login, p);
+	return p;
+}
+
+// Colour for a username on an event card: an explicit override wins, then whatever the
+// payload carried, then the remembered/looked-up Twitch chat colour, then the platform.
+async function EventUserColor(user, platform, override) {
+	if (override) return override;
+	if (user?.color) return user.color;
+	if (platform === 'twitch') {
+		const known = LookupTwitchColor(user?.id, user?.login, user?.name, user?.displayName);
+		if (known) return known;
+		const login = String(user?.login || user?.name || '').toLowerCase();
+		if (login && login !== 'anonymous') {
+			const fetched = await FetchTwitchColor(login);
+			if (fetched) return fetched;
+		}
+	}
+	return GetPlatformColor(platform);
+}
+
 async function renderFeaturedMessage(data, headerText, platform) {
 	const template = document.getElementById('featuredMessageTemplate');
 	if (!template) return;
@@ -269,7 +324,10 @@ async function renderFeaturedMessage(data, headerText, platform) {
 	instance.querySelector("#timestamp").innerText = GetCurrentTimeFormatted();
 
 	const usernameSpan = instance.querySelector("#username");
-	usernameSpan.replaceWith(usernameMarquee(data.user.name, tameUsernameColor(platform === 'twitch' ? '#A644FF' : '#FF0000')));
+	const featuredColor = platform === 'twitch'
+		? await EventUserColor({ ...data.user, color: data.user?.color || data.message?.color }, 'twitch')
+		: '#FF0000';
+	usernameSpan.replaceWith(usernameMarquee(data.user.name, tameUsernameColor(featuredColor)));
 
 	if (data.user.name !== 'Anonymous') {
 		const avatarUrl = await GetAvatar(data.user.name, data.user.profileImageUrl, platform);
@@ -354,7 +412,7 @@ async function renderEventCard(data, type, platform, opts = {}) {
 
 	if (showUsername) {
 		usernameDiv.textContent = senderName;
-		usernameDiv.style.color = tameUsernameColor(opts.color || data.user?.color || GetPlatformColor(platform));
+		usernameDiv.style.color = tameUsernameColor(await EventUserColor(data.user, platform, opts.color));
 		if (senderName === 'Anonymous') usernameDiv.classList.add('is-anonymous');
 	}
 
@@ -388,8 +446,8 @@ async function renderEventCard(data, type, platform, opts = {}) {
 
 			// Sender + receiver names become scrolling marquees that split the row's
 			// width by max-min fairness (allocateGiftRow), replacing the old ellipsis.
-			const senderColor = tameUsernameColor(opts.color || data.user?.color || GetPlatformColor(platform));
-			const receiverColor = tameUsernameColor(opts.color || data.recipient?.color || GetPlatformColor(platform));
+			const senderColor = tameUsernameColor(await EventUserColor(data.user, platform, opts.color));
+			const receiverColor = tameUsernameColor(await EventUserColor(data.recipient, platform, opts.color));
 			const senderText = showUsername ? senderName : '';
 
 			// Wrap the sender's avatar · platform · name into one flex cell.
@@ -488,6 +546,9 @@ async function renderEventCard(data, type, platform, opts = {}) {
 }
 
 async function TwitchChatMessage(data) {
+	// Learn this chatter's colour before any early return, so event cards for people
+	// whose messages we hide (commands, ignored users) still get the right colour.
+	RememberTwitchColor(data.message?.color, data.message?.userId, data.message?.username, data.message?.displayName, data.user?.id, data.user?.login, data.user?.name);
 	if (data.message?.firstMessage) return await renderFeaturedMessage(data, "FIRST TIME CHAT", 'twitch');
 	if (!showTwitchMessages || (data.message.message.startsWith("!") && excludeCommands) || ignoreUserList.includes(data.message.username)) return;
 
@@ -724,7 +785,7 @@ async function renderFollowCard(data, platform, action = 'followed') {
 	const name = data.user?.name || 'Someone';
 
 	if (showUsername) {
-		usernameDiv.replaceWith(usernameMarquee(name, tameUsernameColor(GetPlatformColor(platform))));
+		usernameDiv.replaceWith(usernameMarquee(name, tameUsernameColor(await EventUserColor(data.user, platform))));
 	}
 
 	if (showPlatform && PLATFORMS_WITH_ICONS.has(platform)) {
@@ -971,8 +1032,9 @@ async function YouTubeMessage(data) {
 	if (showBadges) {
 		const badgeListDiv = instance.querySelector("#badgeList");
 		badgeListDiv.innerHTML = ""; 
-		const addBadge = (icon) => { const b = new Image(); b.src = `icons/badges/${icon}`; b.style.filter = `invert(100%)`; b.classList.add("badge"); badgeListDiv.appendChild(b); };
-		if (data.user.isOwner) addBadge('youtube-broadcaster.svg');
+		const addBadge = (icon, invert = true) => { const b = new Image(); b.src = `icons/badges/${icon}`; if (invert) b.style.filter = `invert(100%)`; b.classList.add("badge"); badgeListDiv.appendChild(b); };
+		// Broadcaster uses Twitch's own badge art (already coloured, so no invert).
+		if (data.user.isOwner) addBadge('twitch-broadcaster.png', false);
 		if (data.user.isModerator) addBadge('youtube-moderator.svg');
 		if (data.user.isSponsor) addBadge('youtube-member.svg');
 		if (data.user.isVerified) addBadge('youtube-verified.svg');
@@ -2023,7 +2085,20 @@ function GetPermissionLevel(data, platform) {
 }
 
 // ============================================================
-//  Song lookup (no API key, runs in the browser)
+//  Song lookup (no API key, no server, runs in the browser)
+//
+//  A redemption is free text a viewer typed: "Robbery '95 - Necro",
+//  "Miitopia OST - Extra Battle (Cyberpunk)", "Billie Jeans - Micheal Jackson".
+//  Rather than guess which half is the title, the whole string is searched — the
+//  way a person would paste it into a search box — against YouTube Music (clean
+//  Title/Artist fields, commercial catalogue) and YouTube (game OSTs, remixes,
+//  bootlegs: everything a label never released). Both are reached through Piped,
+//  a CORS-enabled mirror, so this still works from an OBS browser source.
+//
+//  Every result is then SCORED against the words the viewer typed, and anything
+//  that doesn't clear the floor is refused: a card that invents a song is worse
+//  than no card. MusicBrainz and iTunes stay in the pipeline, demoted to what
+//  they are good at — naming the original release and supplying cover art.
 // ============================================================
 
 function FormatSongDuration(ms) {
@@ -2034,23 +2109,130 @@ function FormatSongDuration(ms) {
 	return `${m}:${s}`;
 }
 
-function ParseSongRequest(text) {
-	let parts = text.split(/\s+-\s+/);
-	if (parts.length >= 2) return { title: parts[0].trim(), artist: parts.slice(1).join(' - ').trim() };
-	parts = text.split(/\s+by\s+/i);
-	if (parts.length >= 2) return { title: parts[0].trim(), artist: parts.slice(1).join(' by ').trim() };
-	return { title: text.trim(), artist: '' };
+// Strip the usual junk from a video title: "(Official Video)", "[Audio]", etc.
+function CleanTrackTitle(t) {
+	const junk = /official|video|audio|lyric(?:s)?|visuali[sz]er|remaster(?:ed)?|\bhd\b|\b4k\b|\bmv\b|m\/v|explicit|music\s*video|color\s*coded/i;
+	return (t || '')
+		.replace(/\(([^()]*)\)/g, (full, inner) => junk.test(inner) ? '' : full)
+		.replace(/\[([^\[\]]*)\]/g, (full, inner) => junk.test(inner) ? '' : full)
+		.replace(/\s{2,}/g, ' ')
+		.trim();
 }
 
-async function SpotifyInfoFromUrl(url) {
-	const resp = await fetch('https://open.spotify.com/oembed?url=' + encodeURIComponent(url));
-	if (!resp.ok) return null;
-	const j = await resp.json();
-	return { title: j.title || '', thumbnail: j.thumbnail_url || '' };
+// A featured artist is usually credited on the request but not in the track's own
+// title ("Du ik værd at græde for (feat. Sira Jovina)" is published as "Du ik værd
+// at græde for"). Requiring those words would score the real track below anything
+// that happens to repeat them — a reaction video, say.
+const SONG_FEAT_PART = /[\(\[]\s*(?:feat|ft|featuring|w\/|med)\b\.?[^)\]]*[\)\]]|\s+(?:feat|ft|featuring)\b\.?\s+.*$/gi;
+const StripFeat = s => (s || '').replace(SONG_FEAT_PART, ' ').replace(/\s{2,}/g, ' ').trim();
+
+const songNorm = s => (s || '').toLowerCase().normalize('NFKD').replace(/[‘’“”]/g, "'");
+const songTokens = s => songNorm(s).replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+const songUniq = a => [...new Set(a)];
+
+// Chat misspells. "Billie Jeans - Micheal Jackson" is a letter off in two words and
+// YouTube's own search corrects it — so the scorer must not then punish the correct
+// answer for not matching the typo. Tolerance scales with word length; short words
+// (du, ik, at, for) must still match exactly or everything looks like everything.
+function EditDistance(a, b) {
+	const m = a.length, n = b.length;
+	let prev = Array.from({ length: n + 1 }, (_, j) => j);
+	for (let i = 1; i <= m; i++) {
+		const cur = [i];
+		for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+		prev = cur;
+	}
+	return prev[n];
+}
+const editSlack = n => (n >= 7 ? 2 : n >= 4 ? 1 : 0);
+function FuzzyHas(list, t) {
+	for (const r of list) {
+		if (r === t) return true;
+		const lim = editSlack(Math.max(r.length, t.length));
+		if (lim && Math.abs(r.length - t.length) <= lim && EditDistance(r, t) <= lim) return true;
+	}
+	return false;
+}
+
+// Token F1 between the request and a candidate's "title + artist", feature credits
+// stripped from BOTH sides — the catalogue entry spells every guest out and must not
+// be punished for being complete. Recall alone would let a bloated title win;
+// precision alone would let a one-word title win.
+function ScoreMatch(candidateText, requestText) {
+	const req = songUniq(songTokens(StripFeat(requestText)));
+	const cand = songUniq(songTokens(StripFeat(candidateText)));
+	if (!req.length || !cand.length) return 0;
+	const precision = cand.filter(t => FuzzyHas(req, t)).length / cand.length;
+	const recall = req.filter(t => FuzzyHas(cand, t)).length / req.length;
+	return (precision + recall) ? (2 * precision * recall) / (precision + recall) : 0;
+}
+
+// Uploads that are ABOUT a song rather than the song. They carry both artist names
+// and the full title, so they out-score the real track on words alone.
+const NOT_THE_SONG = /\b(reaction|reakt\w*|reagerer|react(?:s|ing)?|review|anmeldelse|explained|breakdown|analysis|tutorial|karaoke|lesson|interview|first time (?:hearing|listening)|cover(?:ed)? by)\b/i;
+
+// MusicBrainz lists a credit in its own order ("Berg, Svea S, Sofie1998"); the music
+// apps lead with the track's primary artist ("Sofie1998, Berg, Svea S"). Only
+// genuinely new names are appended, so "Tyler, The Creator" is never torn in two.
+function MergeCredit(primary, credit) {
+	const names = (credit || '').split(/\s*(?:,|&|\band\b|\bog\b)\s*/i).map(n => n.trim()).filter(Boolean);
+	const have = songTokens(primary);
+	const extra = names.filter(n => { const t = songTokens(n)[0]; return t && !FuzzyHas(have, t); });
+	return extra.length ? [primary, ...extra].join(', ') : primary;
+}
+
+// ── Network ────────────────────────────────────────────────────────────────
+// One cache for the browser source's lifetime: the artist-credit and the album come
+// from the SAME MusicBrainz URL, and without this each would spend its own request —
+// two a second is how you earn a 503, and a 503 reads as "song not found".
+const _songCache = new Map();
+let _lastMusicBrainz = 0;
+
+async function SongFetch(url, timeoutMs = 5000) {
+	const cached = _songCache.get(url);
+	if (cached) return { ok: true, status: 200, json: async () => JSON.parse(cached || '{}'), text: async () => cached };
+
+	const isMB = /musicbrainz\.org/.test(url);
+	let resp, body;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		// MusicBrainz allows ~1 request/second and answers 503 both above that and when
+		// it is simply busy. A 503 comes back fast and is worth retrying; a silent stall
+		// just costs a second full deadline, so it isn't.
+		if (isMB) {
+			const wait = Math.max(0, 1300 - (Date.now() - _lastMusicBrainz));
+			if (wait) await new Promise(r => setTimeout(r, wait));
+			_lastMusicBrainz = Date.now() + 1;
+		}
+		const ctl = new AbortController();
+		const kill = setTimeout(() => ctl.abort(), timeoutMs);
+		try { resp = await fetch(url, { signal: ctl.signal }); }
+		catch (e) { console.debug('[song] request failed', url, e.name); return { ok: false, status: 0, json: async () => ({}), text: async () => '' }; }
+		finally { clearTimeout(kill); }
+		body = await resp.text();
+		if (resp.status !== 503 || !isMB) break;
+		console.debug('[song] MusicBrainz 503, retrying');
+		await new Promise(r => setTimeout(r, 1500));
+	}
+	if (resp.ok) {
+		if (_songCache.size > 200) _songCache.clear();
+		_songCache.set(url, body);
+	}
+	return { ok: resp.ok, status: resp.status, json: async () => JSON.parse(body || '{}'), text: async () => body };
+}
+
+// A source that hasn't answered by its deadline has nothing to say. MusicBrainz is
+// the slow one and is only ever a second opinion; without this the card waits on it
+// even when YouTube Music has already answered.
+function withDeadline(promise, ms) {
+	let timer;
+	return Promise.race([
+		promise.catch(() => null).finally(() => clearTimeout(timer)),
+		new Promise(res => { timer = setTimeout(() => res(null), ms); })
+	]);
 }
 
 // Resolve true only if the image URL actually loads (catches dead Cover Art Archive
-// links, 404s, etc.). Times out so a slow source can't stall the card forever.
+// links, 404s, hotlink refusals). Times out so a slow source can't stall the card.
 function ImageLoads(url, timeoutMs = 2000) {
 	return new Promise(resolve => {
 		if (!url) return resolve(false);
@@ -2065,189 +2247,361 @@ function ImageLoads(url, timeoutMs = 2000) {
 }
 
 // Start every candidate loading in PARALLEL, then resolve in priority order: returns
-// the highest-priority URL that loads. Because the loads run concurrently, a slow/dead
-// first candidate doesn't block the others — by the time we check them they're ready.
-async function ResolveAlbumArt(candidates) {
-	const checks = candidates.map(url => (url ? ImageLoads(url) : Promise.resolve(false)));
+// the highest-priority URL that loads, so a slow/dead first candidate doesn't block.
+async function ResolveAlbumArt(candidates, timeoutMs) {
+	const checks = candidates.map(url => (url ? ImageLoads(url, timeoutMs) : Promise.resolve(false)));
 	for (let i = 0; i < candidates.length; i++) {
 		if (candidates[i] && await checks[i]) return candidates[i];
 	}
 	return '';
 }
 
-async function SearchMusicBrainz(title, artist) {
-	const query = artist ? `recording:"${title}" AND artist:"${artist}"` : `recording:"${title}"`;
-	const url = 'https://musicbrainz.org/ws/2/recording/?fmt=json&limit=5&query=' + encodeURIComponent(query);
-	const resp = await fetch(url);
-	if (!resp.ok) return null;
-	const rec = ((await resp.json()).recordings || [])[0];
-	if (!rec) return null;
-	
-	const releaseId = (rec.releases || [])[0]?.id;
-	const albumArt = releaseId ? `https://coverartarchive.org/release/${releaseId}/front-500` : '';
-	
-	return {
-		title: rec.title || '',
-		artist: (rec['artist-credit'] || []).map(a => a.name).join(', '),
-		album: (rec.releases || [])[0]?.title || '',
-		durationMs: rec.length || 0,
-		albumArt: albumArt
-	};
-}
+// ── YouTube Music / YouTube, through Piped ─────────────────────────────────
+const PIPED_HOSTS = [
+	'https://pipedapi.ducks.party',
+	'https://api.piped.private.coffee',
+	'https://pipedapi.kavin.rocks'
+];
 
-async function SearchITunes(title, artist) {
-	const term = (title + ' ' + artist).trim();
-	const url = 'https://itunes.apple.com/search?entity=song&limit=15&term=' + encodeURIComponent(term);
-	const resp = await fetch(url);
-	if (!resp.ok) return null;
-	const results = (await resp.json()).results || [];
-	let pick = results[0];
-	if (artist) {
-		const a = artist.toLowerCase();
-		pick = results.find(x => (x.artistName || '').toLowerCase().includes(a)) || pick;
+// YouTube Music serves the same artwork file for a track and for the album it belongs
+// to, so the cover URL doubles as an album id.
+const CoverId = u => (u || '').replace(/^https?:\/\/[^/]+\//, '').split('=')[0].split('?')[0];
+
+// Piped proxies its thumbnails. Ask that proxy for a bigger copy first, then the copy
+// it gave us, then YouTube's own video thumbnail — first one that loads wins.
+function ThumbCandidates(thumb, watchUrl) {
+	const out = [];
+	if (thumb) {
+		out.push(thumb.replace(/=w\d+-h\d+/, '=w544-h544'));
+		out.push(thumb);
 	}
-	if (!pick) return null;
-	
-	const albumArt = pick.artworkUrl100 ? pick.artworkUrl100.replace('100x100bb', '600x600bb') : '';
-	
+	const id = (watchUrl || '').match(/v=([\w-]+)/);
+	if (id) out.push(`https://i.ytimg.com/vi/${id[1]}/hqdefault.jpg`);
+	return out;
+}
+
+async function PipedSearch(query, filter) {
+	for (const host of PIPED_HOSTS) {
+		let j;
+		try {
+			const r = await SongFetch(`${host}/search?q=${encodeURIComponent(query)}&filter=${filter}`, 6000);
+			if (!r.ok) continue;
+			j = await r.json();
+		} catch (e) { continue; }
+		const items = (j.items || []).filter(i => i.title && (i.duration || 0) > 0).slice(0, 6);
+		if (!items.length) return [];
+		return items.map(i => ({
+			title: i.title.trim(),
+			coverId: CoverId(i.thumbnail),
+			artist: (i.uploaderName || '').replace(/\s*-\s*Topic$/i, '').trim(),
+			durationMs: (i.duration || 0) * 1000,
+			artCandidates: ThumbCandidates(i.thumbnail, i.url),
+			via: filter === 'music_songs' ? 'YT Music' : 'YouTube'
+		}));
+	}
+	console.debug('[song] every Piped instance failed');
+	return [];
+}
+
+// `byArtist`: also accept the top album credited to this artist. YouTube Music ranks
+// the album search by relevance to the query — which names the track — so for
+// "Bliv hvor du er - Rosa" the one album by Rosa that comes back is the one holding
+// it. The artist check is what keeps "Den nye pige - Blæst" out of Ramasjang's
+// "Cirkus Summarum 2026".
+async function AlbumSearch(query, coverId, byArtist) {
+	for (const host of PIPED_HOSTS) {
+		let j;
+		try {
+			const r = await SongFetch(`${host}/search?q=${encodeURIComponent(query)}&filter=music_albums`, 6000);
+			if (!r.ok) continue;
+			j = await r.json();
+		} catch (e) { continue; }
+		const items = j.items || [];
+		const wrap = i => ({ album: i.name || i.title || '', artCandidates: ThumbCandidates(i.thumbnail, i.url) });
+		const byCover = items.find(i => CoverId(i.thumbnail) === coverId);
+		if (byCover) return wrap(byCover);
+		if (byArtist) {
+			const same = items.find(i => i.uploaderName && ScoreMatch(i.uploaderName, byArtist) >= 0.6);
+			if (same) return wrap(same);
+		}
+		return null;
+	}
+	return null;
+}
+
+// A track's cover is often its single's, not its album's, so the cover match alone
+// isn't enough; and a feature credit in the query narrows the album search to nothing.
+async function YouTubeMusicAlbum(query, coverId, artist, trustArtistMatch) {
+	if (!coverId) return null;
+	let hit = await AlbumSearch(query, coverId, trustArtistMatch ? artist : null);
+	const bare = StripFeat(query);
+	if (!hit && bare && bare !== query) hit = await AlbumSearch(bare, coverId, trustArtistMatch ? artist : null);
+	if (!hit && artist) hit = await AlbumSearch(artist, coverId);
+	return hit;
+}
+
+// ── MusicBrainz / iTunes: the original release, and the full credit ────────
+// Reissues, best-ofs and remaster compilations are rejected outright: taking
+// releases[0] of recordings[0] is how "Spokesman" ended up on a 2005 best-of and
+// "Robbery '95" picked up the cover of a 2020 remaster nobody asked for.
+const BAD_SECONDARY = /compilation|live|dj-mix|mixtape|interview|audiobook|spokenword|remix/i;
+const BAD_RELEASE_TITLE = /\b(best of|greatest hits|anthology|essential|very best|remaster(?:ed)?)\b/i;
+const RELEASE_RANK = { Album: 0, EP: 1, Single: 2 };
+const CoverArt = id => `https://coverartarchive.org/release/${id}/front-500`;
+
+async function MusicBrainzOriginal(rawTitle, artist) {
+	const title = StripFeat(rawTitle) || rawTitle;   // a credit in the title matches nothing
+	const query = artist ? `recording:"${title}" AND artist:"${artist}"` : `recording:"${title}"`;
+	// limit=100, not 25: for a track with dozens of reissues (Billie Jean) the original
+	// album ranks below the first 25 rows and a smaller page misses it entirely.
+	const resp = await SongFetch('https://musicbrainz.org/ws/2/recording/?fmt=json&limit=100&query=' + encodeURIComponent(query), 5000);
+	if (!resp.ok) return null;
+	const recs = (await resp.json()).recordings || [];
+	if (!recs.length) return null;
+
+	// The full artist credit, worth having even when no release survives the filter:
+	// the credit and the album are separate questions and this response answers both.
+	let credit = '';
+	for (const rec of recs.slice(0, 5)) {
+		const c = (rec['artist-credit'] || []).map(a => a.name).join(', ');
+		if (c && FuzzyHas(songTokens(c), songTokens(artist)[0] || '')) { credit = c; break; }
+	}
+
+	const seen = new Set(), keep = [];
+	for (const rec of recs) {
+		const rc = (rec['artist-credit'] || []).map(a => a.name).join(', ');
+		for (const rel of rec.releases || []) {
+			const rg = rel['release-group'] || {};
+			if (BAD_SECONDARY.test((rg['secondary-types'] || []).join(', ')) || BAD_RELEASE_TITLE.test(rel.title || '')) continue;
+			if (seen.has(rel.id)) continue;
+			seen.add(rel.id);
+			keep.push({
+				id: rel.id, album: rel.title || '', recTitle: rec.title || '', artist: rc,
+				durationMs: rec.length || 0, rank: RELEASE_RANK[rg['primary-type']] ?? 3,
+				date: rel.date || rg['first-release-date'] || '9999'
+			});
+		}
+	}
+	if (!keep.length) return { credit, title: recs[0].title || '', artist: credit, album: '', durationMs: 0, artCandidates: [] };
+
+	// Earliest release wins — except that a single released as part of an album campaign
+	// should credit the album, and the same calendar year is the tell: "Monster" and "My
+	// Beautiful Dark Twisted Fantasy" are both 2010 (album), while "Die With A Smile"
+	// (2024) stood alone until MAYHEM (2025) (single). Partial dates pad with 99 so a
+	// bare year sorts after a dated release in the same year.
+	const when = d => { const p = String(d).split('-'); return [p[0] || '9999', p[1] || '99', p[2] || '99'].join('-'); };
+	keep.sort((a, b) => when(a.date).localeCompare(when(b.date)) || a.rank - b.rank);
+	let top = keep[0];
+	if (top.rank !== 0) {
+		const sameYear = keep.find(k => k.rank === 0 && String(k.date).slice(0, 4) === String(top.date).slice(0, 4));
+		if (sameYear) top = sameYear;
+	}
+	// Several pressings share one album but only some have cover art, so offer them all.
 	return {
-		title: pick.trackName || '',
-		artist: pick.artistName || '',
-		album: pick.collectionName || '',
-		durationMs: pick.trackTimeMillis || 0,
-		albumArt: albumArt
+		credit, title: top.recTitle, artist: top.artist, album: top.album, durationMs: top.durationMs,
+		artCandidates: keep.filter(k => k.album === top.album).slice(0, 6).map(k => CoverArt(k.id))
 	};
 }
 
-// Read a Spotify TRACK's exact metadata from its public embed page (the same data the
-// Python scraper reads). The embed is CORS-blocked, so we go through a public CORS proxy
-// — meaning no server is needed on the streamer's PC, just the browser source. Returns
-// authoritative title/artist/duration/art (album name isn't in the embed; filled later).
-async function SpotifyEmbedInfo(url) {
-	const idMatch = url.match(/track[/:]([A-Za-z0-9]+)/);
-	if (!idMatch) return null;
-	const embed = 'https://open.spotify.com/embed/track/' + idMatch[1];
-	let html;
-	try {
-		const resp = await fetch('https://corsproxy.io/?url=' + encodeURIComponent(embed));
-		if (!resp.ok) return null;
-		html = await resp.text();
-	} catch (e) { return null; }
-
-	const m = html.match(/<script id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s);
-	if (!m) return null;
-	let entity;
-	try { entity = JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity; } catch (e) { return null; }
-	if (!entity || !entity.name) return null;
-
-	const artist = (entity.artists || []).map(a => a.name).filter(Boolean).join(', ') || entity.subtitle || '';
-	let albumArt = '';
-	const vi = entity.visualIdentity?.image || [];
-	if (vi.length) albumArt = vi.slice().sort((a, b) => (b.maxWidth || 0) - (a.maxWidth || 0))[0].url;
-	if (!albumArt && entity.coverArt?.sources?.length) albumArt = entity.coverArt.sources.slice().sort((a, b) => (b.width || 0) - (a.width || 0))[0].url;
-
-	return { title: entity.name, artist, durationMs: entity.duration || 0, albumArt, authoritative: true };
-}
-
-// Strip the usual junk from a (YouTube) video title: "(Official Video)", "[Audio]", etc.
-function CleanTrackTitle(t) {
-	const junk = /official|video|audio|lyric(?:s)?|visuali[sz]er|remaster(?:ed)?|\bhd\b|\b4k\b|\bmv\b|m\/v|explicit|music\s*video|color\s*coded/i;
-	return (t || '')
-		.replace(/\(([^()]*)\)/g, (full, inner) => junk.test(inner) ? '' : full)
-		.replace(/\[([^\[\]]*)\]/g, (full, inner) => junk.test(inner) ? '' : full)
-		.replace(/\s{2,}/g, ' ')
-		.trim();
-}
-
-// Resolve a YouTube / YouTube Music link to a {title, artist} seed via public oEmbed.
-// YouTube titles are usually "Artist - Song"; if there's no dash we fall back to the
-// channel name (minus "VEVO" / "- Topic") as the artist.
-async function YouTubeInfo(url) {
-	let resp;
-	try { resp = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(url)); }
-	catch (e) { return null; }
+async function ITunesOriginal(rawTitle, artist) {
+	const title = StripFeat(rawTitle) || rawTitle;
+	const term = (title + ' ' + artist).trim();
+	const resp = await SongFetch('https://itunes.apple.com/search?entity=song&limit=15&term=' + encodeURIComponent(term), 5000);
 	if (!resp.ok) return null;
-	const j = await resp.json();
-	const cleaned = CleanTrackTitle(j.title || '');
-	if (!cleaned) return null;
-
-	let title, artist;
-	const parts = cleaned.split(/\s+-\s+/);
-	if (parts.length >= 2) { artist = parts[0].trim(); title = parts.slice(1).join(' - ').trim(); }
-	else { title = cleaned; artist = (j.author_name || '').replace(/\s*-\s*Topic$/i, '').replace(/VEVO$/i, '').trim(); }
-
-	return { title, artist, authoritative: false };
+	let results = (await resp.json()).results || [];
+	if (artist) {
+		const a = songNorm(artist);
+		const byArtist = results.filter(x => songNorm(x.artistName).includes(a) || a.includes(songNorm(x.artistName)));
+		if (byArtist.length) results = byArtist;
+	}
+	results = results.filter(x => !BAD_RELEASE_TITLE.test(x.collectionName || ''));
+	if (!results.length) return null;
+	results.sort((a, b) => String(a.releaseDate || '').localeCompare(String(b.releaseDate || '')));
+	const pick = results[0];
+	return {
+		title: pick.trackName || '', artist: pick.artistName || '', album: pick.collectionName || '',
+		durationMs: pick.trackTimeMillis || 0,
+		artCandidates: pick.artworkUrl100 ? [pick.artworkUrl100.replace('100x100bb', '600x600bb')] : []
+	};
 }
+
+// A pasted link isn't searchable text, so turn it into some.
+//
+// YouTube's oEmbed is enough on its own — its title is normally "Artist - Song".
+// Spotify's is NOT: it returns the track title and nothing else, so a link to
+// "Spinnin" by Connor Price came back as a different song called Spinnin. The artist
+// only exists on the track page, which is CORS-blocked (and the corsproxy.io the old
+// code used now wants an API key). r.jina.ai renders that page as text and is
+// CORS-open, so one request gets the title, the artists, the album, the length and
+// the cover art:
+//
+//   Title: Spinnin - song and lyrics by Connor Price, Bens
+//   •[Spin The Globe](…)•2023•1:50•249,599,022
+async function SpotifyTrackInfo(url) {
+	const id = url.match(/track[/:]([A-Za-z0-9]+)/);
+	if (!id) return null;
+	const r = await SongFetch('https://r.jina.ai/https://open.spotify.com/track/' + id[1], 9000);
+	if (!r.ok) return null;
+	const text = await r.text();
+
+	const head = text.match(/^Title:\s*(.+?)\s+-\s+song and lyrics by\s+(.+?)\s*$/m);
+	if (!head) return null;
+	const meta = text.match(/•\[([^\]]+)\]\([^)]*\)•(\d{4})•(\d+):(\d{2})•/);
+	const art = text.match(/!\[Image \d+:[^\]]*\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
+
+	return {
+		title: head[1].trim(),
+		artist: head[2].trim(),
+		album: meta ? meta[1].trim() : '',
+		durationMs: meta ? (Number(meta[3]) * 60 + Number(meta[4])) * 1000 : 0,
+		albumArt: art ? art[1] : ''
+	};
+}
+
+async function LinkToQuery(url) {
+	try {
+		if (/open\.spotify\.com|spotify:/i.test(url)) {
+			const r = await SongFetch('https://open.spotify.com/oembed?url=' + encodeURIComponent(url), 4000);
+			if (r.ok) { const j = await r.json(); if (j.title) return CleanTrackTitle(j.title); }
+		} else if (/youtube\.com\/watch|youtu\.be\/|music\.youtube\.com/i.test(url)) {
+			const r = await SongFetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(url), 4000);
+			if (r.ok) { const j = await r.json(); if (j.title) return CleanTrackTitle(j.title); }
+		}
+	} catch (e) { /* fall through to searching the raw link text */ }
+	return '';
+}
+
+const SONG_MATCH_FLOOR = 0.45;   // below this: no card, the request shows as a plain message
 
 async function GetSongInfo(request) {
-	const input = (request || '').trim();
-	if (!input) { console.warn('[song] empty request'); return null; }
+	let input = (request || '').trim();
+	if (!input) return null;
 
-	// Resolve the input into a search "seed". A Spotify track embed is authoritative
-	// (exact title/artist/duration/art); YouTube links and plain text only seed the search.
-	let seed = null;
-	if (/open\.spotify\.com\/track|spotify:track:/i.test(input)) {
-		seed = await SpotifyEmbedInfo(input);
-		if (!seed) {                                   // proxy/embed failed → oEmbed title + thumbnail
-			const sp = await SpotifyInfoFromUrl(input).catch(() => null);
-			if (sp) { const p = ParseSongRequest(sp.title || ''); seed = { title: p.title, artist: p.artist, albumArt: sp.thumbnail, authoritative: false }; }
+	// A Spotify track link is a request for THAT recording, so its own metadata is the
+	// fallback if the search can't place it.
+	let spotify = null;
+	if (/^https?:\/\//i.test(input) || /^spotify:/i.test(input)) {
+		if (/open\.spotify\.com\/track|spotify:track:/i.test(input)) {
+			spotify = await withDeadline(SpotifyTrackInfo(input), 10000);
+			if (spotify) input = `${spotify.title} ${spotify.artist}`;
 		}
-	} else if (/open\.spotify\.com|spotify:/i.test(input)) {   // album/playlist/other Spotify → best-effort
-		const sp = await SpotifyInfoFromUrl(input).catch(() => null);
-		if (sp) { const p = ParseSongRequest(sp.title || ''); seed = { title: p.title, artist: p.artist, albumArt: sp.thumbnail, authoritative: false }; }
-	} else if (/youtube\.com\/watch|youtu\.be\/|music\.youtube\.com/i.test(input)) {
-		seed = await YouTubeInfo(input);
-	} else {
-		const p = ParseSongRequest(input);
-		seed = { title: p.title, artist: p.artist, authoritative: false };
+		if (!spotify) {
+			const fromLink = await LinkToQuery(input);
+			if (fromLink) input = fromLink;
+		}
 	}
+	const spotifyCard = async () => {
+		if (!spotify || !spotify.title) return null;
+		const art = await ResolveAlbumArt([spotify.albumArt], 4000);
+		if (!art) return null;
+		console.log(`[song] using Spotify's own metadata for "${spotify.title}"`);
+		return { title: spotify.title, artist: spotify.artist, album: spotify.album || 'No album', durationMs: spotify.durationMs, albumArt: art };
+	};
 
-	if (!seed || !seed.title) { console.warn(`[song] could not resolve "${input}"`); return null; }
-
-	// Enrich (album/duration/art + canonical names) via MusicBrainz + iTunes in parallel.
-	const [mb, itunes] = await Promise.all([
-		SearchMusicBrainz(seed.title, seed.artist).catch(e => { console.debug('[song] MusicBrainz error', e); return null; }),
-		SearchITunes(seed.title, seed.artist).catch(e => { console.debug('[song] iTunes error', e); return null; }),
+	// 1 — ask both catalogues with the request exactly as the viewer typed it
+	const [songs, videos] = await Promise.all([
+		PipedSearch(input, 'music_songs').catch(() => []),
+		PipedSearch(input, 'videos').catch(() => [])
 	]);
-	// Resolve the album ART first, then take title/artist/album from whichever service
-	// actually supplied that working art — so the text on the card always matches the
-	// artwork shown. This is what makes the result "right" far more often than blindly
-	// trusting MusicBrainz: a wrong/obscure MB match no longer overrides a correct iTunes
-	// one. If no art source loaded, fall back to iTunes text, then MusicBrainz.
-	let info;
-	if (seed.authoritative) {
-		// Authoritative seed (Spotify embed): keep its own title/artist/duration/art;
-		// only borrow the album name, matched to whichever source provided the art.
-		const artCandidates = [seed.albumArt, itunes && itunes.albumArt, mb && mb.albumArt];
-		const resolvedArt = await ResolveAlbumArt(artCandidates);
-		let album = '';
-		if (resolvedArt && itunes && resolvedArt === itunes.albumArt) album = itunes.album;
-		else if (resolvedArt && mb && resolvedArt === mb.albumArt) album = mb.album;
-		else album = (itunes || mb || {}).album || '';
-		info = {
-			title: seed.title,
-			artist: seed.artist,
-			album,
-			durationMs: seed.durationMs || (itunes || mb || {}).durationMs || 0,
-			albumArt: resolvedArt,
-		};
-	} else {
-		// Non-authoritative seed: make the displayed text match the artwork we end up showing.
-		const artCandidates = [itunes && itunes.albumArt, mb && mb.albumArt, seed.albumArt];
-		const resolvedArt = await ResolveAlbumArt(artCandidates);
-		let bestSource = null;
-		if (resolvedArt) {
-			if (itunes && resolvedArt === itunes.albumArt) bestSource = itunes;
-			else if (mb && resolvedArt === mb.albumArt) bestSource = mb;
-		}
-		if (!bestSource) bestSource = itunes || mb || {};   // no art matched → prefer iTunes text, then MB
-		info = bestSource.title
-			? { title: bestSource.title, artist: bestSource.artist, album: bestSource.album || '', durationMs: bestSource.durationMs || 0, albumArt: resolvedArt }
-			: { title: seed.title, artist: seed.artist, album: '', durationMs: 0, albumArt: resolvedArt };
+
+	// 2 — score every candidate against the request
+	const featWords = songTokens(input).filter(t => !songTokens(StripFeat(input)).includes(t) && !/^(feat|ft|featuring|med)$/.test(t));
+	const scored = [...songs, ...videos]
+		.filter(c => !NOT_THE_SONG.test(c.title))
+		.map(c => {
+			const text = CleanTrackTitle(c.title) + ' ' + c.artist;
+			let score = ScoreMatch(text, input);
+			if (c.via === 'YT Music') score += 0.06;                                              // a music catalogue, not a video site
+			if (featWords.length && featWords.every(w => FuzzyHas(songTokens(text), w))) score += 0.05;
+			return { ...c, score };
+		})
+		.sort((a, b) => b.score - a.score);
+
+	let best = scored[0];
+	// A link is a request for one specific recording, and length is what identifies it:
+	// "Spinnin" is 1:50 on Spotify but the music video on YouTube runs 2:19, and on words
+	// alone the video wins because its title repeats both artists.
+	if (spotify && spotify.durationMs) {
+		const sameLength = scored.find(c => c.score >= SONG_MATCH_FLOOR && Math.abs(c.durationMs - spotify.durationMs) <= 3000);
+		if (sameLength) best = sameLength;
 	}
+	// Same length = same recording. If the winner is a YouTube upload but that very
+	// recording is also in the YouTube Music catalogue, take the catalogue one: same
+	// audio, but a real artist field and an album instead of a re-upload channel's name.
+	if (best && best.via !== 'YT Music') {
+		const twin = scored.find(c => c.via === 'YT Music' && c.score >= SONG_MATCH_FLOOR && Math.abs(c.durationMs - best.durationMs) <= 3000);
+		if (twin) best = twin;
+	}
+	if (!best || best.score < SONG_MATCH_FLOOR) {
+		console.warn(`[song] nothing matched "${input}"`);
+		return await spotifyCard();
+	}
+
+	// 3 — the album. Ask all three at once, in order of how likely each is to name the
+	// ORIGINAL release, and whichever names it must also supply the artwork: a card
+	// labelled "Thriller" showing the HIStory sleeve is worse than either on its own.
+	const [mbOrig, ytAlbum, itunes] = await Promise.all([
+		withDeadline(MusicBrainzOriginal(best.title, best.artist), 6000),
+		withDeadline(YouTubeMusicAlbum(input, best.coverId, best.artist, best.via === 'YT Music'), 8000),
+		withDeadline(ITunesOriginal(best.title, best.artist), 5000)
+	]);
+	// "Belongs to this track" is a containment question, not a similarity one:
+	// MusicBrainz credits "Monster" to five artists, which a similarity score reads as
+	// a different song entirely.
+	const mine = songTokens(best.artist)[0] || '';
+	const trust = r => !!r && !!r.title && ScoreMatch(r.title, best.title) >= 0.6 && (!mine || FuzzyHas(songTokens(r.artist || ''), mine));
+
+	let album = '', albumArt = '', extraMs = 0;
+	for (const [src, wait] of [[trust(mbOrig) ? mbOrig : null, 4000], [ytAlbum, 2000], [trust(itunes) ? itunes : null, 2000]]) {
+		if (!src || !src.album) continue;
+		const art = await ResolveAlbumArt(src.artCandidates || [], wait);
+		if (!art) continue;
+		album = src.album; albumArt = art; extraMs = src.durationMs || 0;
+		break;
+	}
+	if (!album) albumArt = await ResolveAlbumArt(best.artCandidates || []);
+
+	// 4 — the artist line. YouTube Music exposes ONE artist (the channel that owns the
+	// track), so every collaborator is missing unless it was written into the title.
+	// Three ways to get them back, none costing a request of its own: the credit that
+	// came back with the album lookups, the "(feat. …)" in the title, and — last resort,
+	// so a slow lookup can't silently shorten a credit — the one the viewer typed.
+	let artist = best.artist;
+	for (const credit of [mbOrig && mbOrig.credit, trust(itunes) && itunes.artist]) {
+		if (!credit) continue;
+		const merged = MergeCredit(artist, credit);
+		if (songUniq(songTokens(merged)).length > songUniq(songTokens(artist)).length) artist = merged;
+	}
+	const creditedIn = text => {
+		const m = (text || '').match(/[\(\[]\s*(?:feat|ft|featuring|med)\b\.?\s*([^)\]]+)[\)\]]/i);
+		if (!m) return [];
+		return m[1].split(/\s*(?:,|&|\band\b|\bog\b)\s*/i).map(n => n.trim()).filter(Boolean)
+			.filter(n => { const t = songTokens(n)[0]; return t && !FuzzyHas(songTokens(artist), t); });
+	};
+	for (const names of [creditedIn(best.title), creditedIn(input)]) {
+		if (names.length) artist = [artist, ...names].join(', ');
+	}
+
+	// No artwork means a card with a grey hole in it, and the overlay already has a
+	// better answer for that: return nothing, and the redemption renders with the
+	// request as its message, word for word.
+	if (!albumArt) {
+		console.warn(`[song] no artwork loaded for "${input}"`);
+		return await spotifyCard();
+	}
+
+	// The guests are on the artist line now, so the title doesn't need them too:
+	// "Monster (feat. JAY-Z, Rick Ross, Nicki Minaj & Bon Iver)" → "Monster".
+	const info = {
+		title: StripFeat(best.title) || best.title,
+		artist,
+		album: album || 'No album',
+		durationMs: best.durationMs || extraMs,
+		albumArt
+	};
 
 	console.log(
-		`%c♪ ${info.title}%c\n   Artist:   ${info.artist}\n   Album:    ${info.album}\n   Duration: ${FormatSongDuration(info.durationMs)}\n   Art URL:  ${info.albumArt || '(none found)'}`,
+		`%c♪ ${info.title}%c\n   Artist:   ${info.artist}\n   Album:    ${info.album}\n   Duration: ${FormatSongDuration(info.durationMs)}\n   Source:   ${best.via} (match ${best.score.toFixed(2)})\n   Art URL:  ${info.albumArt}`,
 		'font-weight:bold;font-size:13px', 'font-weight:normal'
 	);
 	return info;
