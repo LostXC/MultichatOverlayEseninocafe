@@ -60,7 +60,7 @@ const boilStep = Math.max(0, Math.min(4, GetFloatParam("boilStep") ?? 0.178));
 
 const font = urlParams.get("font") || "";
 const fontSize = urlParams.get("fontSize") || "18";
-const fontColor = urlParams.get("fontColor") || "#000000";
+const fontColor = urlParams.get("fontColor") || "#ffffff";
 const contrastOutline = GetBooleanParam("contrastOutline", false);
 const background = urlParams.get("background") || "#ffffff";
 const backgroundOpacity = GetIntParam("backgroundOpacity") ?? 100;
@@ -110,6 +110,220 @@ if (font) document.body.style.fontFamily = font;
 document.body.style.fontSize = `${fontSize}px`;
 document.documentElement.style.setProperty('--font-color', fontColor);
 if (contrastOutline) document.body.classList.add('contrast-outline');
+
+/* ══ Contrast outline + 3D extrude ═══════════════════════════════════════════
+   Always on — it is no longer behind ?contrastOutline. Chat messages only; the
+   bordered cards have their own solid backgrounds and are untouched.
+
+   Four techniques, because four different kinds of shape:
+     text / usernames   16-copy text-shadow ring, then a filter extrude
+     reply arrow + line  one inline SVG drawing the path twice (wide dark, then light)
+     badges + platform   a mask UNION, built below
+     avatars             box-shadow rings (a disc IS its border box)
+
+   Two rasteriser facts drive the whole design:
+
+   1. Chained drop-shadow offsets are FLOORED to whole pixels. A fractional per-pass
+      offset therefore contributes nothing at all, and 1.01px through 1.99px all
+      contribute exactly one pixel. So the extrude is built as N passes of exactly
+      1px and the DEPTH is varied by changing N, not by scaling the offset.
+   2. Chained passes compose as a Minkowski sum, so ±1px in x and y makes a SQUARE
+      dilation whose corner pixel is a tooth on any 45° contour — and each extrude
+      pass then carries that tooth another pixel down. Mask layers under
+      mask-composite:add are a true union instead, with no compounding, and they
+      are not floored, so the ring can sample a real circle at fractional offsets
+      and a rounded corner comes out at radius R + r.                            */
+const OUTLINE = {
+	hrEm:     0.05,   // outline thickness, em
+	depthEm:  0.13,   // 3D extrude depth, em
+	imgScale: 1,      // extrude multiplier for badges / platform icons
+	avScale:  0.9,    // ...and for avatars: a full-bleed disc shows its whole
+	                  //    extrude as one crescent and reads deeper than it measures
+	dirX: 0, dirY: 1, // straight down
+	colour: '#000000',
+	ringPoints: 12,   // 12 is where the polygon stops reading as a polygon at icon size
+};
+
+const _oFs    = Number(fontSize) || 18;
+const _oHr    = Math.max(0.5, OUTLINE.hrEm * _oFs);
+const _oDepth = OUTLINE.depthEm * _oFs;
+
+// N passes of exactly 1px, walking integer positions along the direction vector.
+function BuildExtrudeFilter(totalPx) {
+	const n = Math.round(totalPx);
+	if (n < 1) return 'none';
+	const tx = OUTLINE.dirX * totalPx, ty = OUTLINE.dirY * totalPx;
+	const out = [];
+	let px = 0, py = 0;
+	for (let k = 1; k <= n; k++) {
+		const qx = Math.round(tx * k / n), qy = Math.round(ty * k / n);
+		if (qx - px || qy - py) out.push(`drop-shadow(${qx - px}px ${qy - py}px 0 ${OUTLINE.colour})`);
+		px = qx; py = qy;
+	}
+	return out.length ? out.join(' ') : 'none';
+}
+
+const _oRoot = document.documentElement.style;
+_oRoot.setProperty('--o-hr', _oHr + 'px');
+_oRoot.setProperty('--o-colour', OUTLINE.colour);
+_oRoot.setProperty('--o-text-extrude', BuildExtrudeFilter(_oDepth));
+{
+	// avatar: a ring plus three offset rings, unioned. box-shadows are all drawn from
+	// the element rather than chained, so they keep sub-pixel precision.
+	const step = _oDepth * OUTLINE.avScale / 3, dx = OUTLINE.dirX, dy = OUTLINE.dirY;
+	const rings = [1, 2, 3].map(k =>
+		`${(dx * step * k).toFixed(3)}px ${(dy * step * k).toFixed(3)}px 0 var(--o-hr) ${OUTLINE.colour}`);
+	_oRoot.setProperty('--o-avatar-shadow', `0 0 0 var(--o-hr) ${OUTLINE.colour}, ` + rings.join(', '));
+}
+
+/* Badges and platform icons are <img>, so no text-shadow and no SVG stroke is
+   available. The silhouette is one masked element carrying the icon repeated at
+   every offset in (circle ⊕ extrude segment), painted flat, with the real icon on
+   top. The offsets never change once the settings are read, so the layer strings
+   are built once here rather than per icon. */
+const _oIconStyle = (() => {
+	const r = _oHr, total = _oDepth * OUTLINE.imgScale;
+	const ring = [[0, 0]];
+	for (let i = 0; i < OUTLINE.ringPoints; i++) {
+		const a = (i / OUTLINE.ringPoints) * Math.PI * 2;
+		ring.push([+(Math.cos(a) * r).toFixed(3), +(Math.sin(a) * r).toFixed(3)]);
+	}
+	const steps = Math.max(1, Math.ceil(total));
+	const seg = [];
+	for (let k = 0; k <= steps; k++) {
+		const t = total * k / steps;
+		seg.push([+(OUTLINE.dirX * t).toFixed(3), +(OUTLINE.dirY * t).toFixed(3)]);
+	}
+	const seen = new Set(), offs = [];
+	for (const [ax, ay] of ring) for (const [bx, by] of seg) {
+		const x = +(ax + bx).toFixed(3), y = +(ay + by).toFixed(3), key = x + ',' + y;
+		if (!seen.has(key)) { seen.add(key); offs.push([x, y]); }
+	}
+	return {
+		offs,
+		pad: Math.ceil(r + total + 1),
+		position: offs.map(([x, y]) => `calc(50% + ${x}px) calc(50% + ${y}px)`).join(','),
+	};
+})();
+
+/* Alpha-threshold the mask source.
+
+   mask-composite:add composites as a + b(1-a) per layer, so a pixel with even a
+   trace of alpha is driven towards opaque once ~50 layers overlap it: Twitch's
+   Prime badge has corner alpha 6/255, and 1 - (1 - 0.024)^52 is about 0.72. The
+   union therefore MANUFACTURES a solid corner out of a nearly invisible one, and
+   the outline squares off around a badge that looks rounded.
+
+   Kill the faint pixels before they are ever unioned. The ramp keeps a soft edge
+   where the artwork genuinely is soft (mid alphas pass through, rescaled) and
+   zeroes everything under the low mark, which is the halo that was building up.
+
+   Object URLs, not data URLs: the mask-image list repeats the source once per
+   layer, and 52 copies of a base64 PNG would be ~100KB of inline CSS per icon.
+
+   Falls back to the untouched src if the canvas is tainted or the image fails, so
+   a CDN without CORS headers degrades to the previous behaviour rather than
+   losing its outline. Cached per src — each badge is processed once per session.
+
+   NOTE: this reads pixels, so it needs a second CORS fetch of each badge.
+   static-cdn.jtvnw.net sends access-control-allow-origin:*, so it works today. */
+const _oMaskCache = new Map();
+function ThresholdedMask(src) {
+	if (_oMaskCache.has(src)) return _oMaskCache.get(src);
+	const job = new Promise(resolve => {
+		const im = new Image();
+		im.crossOrigin = 'anonymous';
+		im.onerror = () => resolve(null);
+		im.onload = () => {
+			try {
+				const c = document.createElement('canvas');
+				c.width = im.naturalWidth; c.height = im.naturalHeight;
+				const g = c.getContext('2d', { willReadFrequently: false });
+				g.drawImage(im, 0, 0);
+				const data = g.getImageData(0, 0, c.width, c.height);
+				const px = data.data, LO = 90, HI = 190;   // ~0.35 and ~0.75 of 255
+				for (let i = 3; i < px.length; i += 4) {
+					const a = px[i];
+					px[i] = a <= LO ? 0 : a >= HI ? 255 : Math.round(255 * (a - LO) / (HI - LO));
+				}
+				g.putImageData(data, 0, 0);
+				c.toBlob(b => resolve(b ? URL.createObjectURL(b) : null), 'image/png');
+			} catch (e) { resolve(null); }        // tainted canvas
+		};
+		im.src = src;
+	});
+	_oMaskCache.set(src, job);
+	return job;
+}
+
+function ApplyIconOutline(img) {
+	if (!img || img.dataset.oDone === '1') return;
+	const ci = getComputedStyle(img);
+	const iw = img.naturalWidth, ih = img.naturalHeight;
+	if (!iw || !ih) {                       // not decoded yet — come back on load
+		img.addEventListener('load', () => ApplyIconOutline(img), { once: true });
+		return;
+	}
+	img.dataset.oDone = '1';
+
+	let wrap = img.closest('.o-ic');
+	if (!wrap) {
+		wrap = document.createElement('span');
+		wrap.className = 'o-ic';
+		img.parentNode.insertBefore(wrap, img);
+		wrap.appendChild(document.createElement('span')).className = 'o-ic-sil';
+		wrap.appendChild(img);
+		// style.css puts the spacing margins and the display mode on the IMG itself
+		// (.platform is display:flex + margin-left:7px), so the wrapper has to take
+		// both or the icon shifts off its baseline and the silhouette box is wrong.
+		wrap.style.margin = `${ci.marginTop} ${ci.marginRight} ${ci.marginBottom} ${ci.marginLeft}`;
+		wrap.style.display = ci.display === 'inline' ? 'inline-block' : ci.display;
+		wrap.style.verticalAlign = ci.verticalAlign;
+		img.style.margin = '0';
+	}
+
+	// object-fit:contain leaves very little slack inside the icon's own box, so the
+	// silhouette is padded by the full reach and the mask pinned to an explicit size
+	// (mask-size:contain would rescale when the box grows). The padded box stays
+	// concentric, so 50% still centres where object-fit put the image.
+	const bw = parseFloat(ci.width), bh = parseFloat(ci.height);
+	const k = Math.min(bw / iw, bh / ih);
+	const size = `${(iw * k).toFixed(2)}px ${(ih * k).toFixed(2)}px`;
+	const src = img.getAttribute('src');
+	const n = _oIconStyle.offs.length;
+	const sil = wrap.querySelector('.o-ic-sil');
+
+	const paint = (maskSrc) => {
+		const url = `url("${maskSrc}")`;
+		sil.style.cssText =
+			`position:absolute;inset:${-_oIconStyle.pad}px;pointer-events:none;` +
+			`background:${OUTLINE.colour};` +
+			`-webkit-mask-image:${Array(n).fill(url).join(',')};mask-image:${Array(n).fill(url).join(',')};` +
+			`-webkit-mask-position:${_oIconStyle.position};mask-position:${_oIconStyle.position};` +
+			`-webkit-mask-size:${Array(n).fill(size).join(',')};mask-size:${Array(n).fill(size).join(',')};` +
+			`-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;` +
+			`-webkit-mask-composite:source-over;mask-composite:add;`;
+	};
+
+	paint(src);                                   // show something immediately...
+	ThresholdedMask(src).then(u => { if (u) paint(u); });   // ...then sharpen the corners
+}
+
+// Icons arrive with each message, so outline them as they land.
+new MutationObserver(muts => {
+	for (const m of muts) for (const node of m.addedNodes) {
+		if (node.nodeType !== 1) continue;
+		if (node.matches && node.matches('#messageContainer #platform img, #messageContainer #badgeList img'))
+			ApplyIconOutline(node);
+		if (node.querySelectorAll)
+			node.querySelectorAll('#messageContainer #platform img, #messageContainer #badgeList img')
+				.forEach(ApplyIconOutline);
+	}
+// (queried directly: `const messageList` is declared further down this file, so
+//  referencing it here would hit the temporal dead zone.)
+}).observe(document.getElementById('messageList'), { childList: true, subtree: true });
+
+
 const mainContainer = document.getElementById('mainContainer');
 mainContainer.style.background = hexToRgba(background, backgroundOpacity / 100);
 
@@ -251,13 +465,16 @@ function tameUsernameColor(color, maxLum = USERNAME_LUM_MAX, minLum = USERNAME_L
     return color;
 }
 
-// Username colour for chat messages. The same taming runs whether or not the outline is
-// on; with the outline on we use a gentler bright cap (less darkening) and a higher dark
-// floor (a bit lighter), since the dark stroke is already providing contrast.
+// Username colour for chat messages. Chat always has the outline now, so it always
+// takes the gentler band — a less aggressive bright cap and a higher dark floor,
+// because the dark stroke is doing the contrast work. Event cards still call
+// tameUsernameColor() with the default (stricter) band, since they sit on solid white.
 function usernameChatColor(color) {
-    return contrastOutline
-        ? tameUsernameColor(color, USERNAME_LUM_MAX_OUTLINE, USERNAME_LUM_MIN_OUTLINE)
-        : tameUsernameColor(color, USERNAME_LUM_MAX, USERNAME_LUM_MIN);
+    // The outline is always on now, so always use the gentler band: the dark stroke
+    // is providing the contrast, so bright names need less darkening and dark names
+    // less lightening. (?contrastOutline is still read for backwards compatibility
+    // with existing browser-source URLs, but no longer gates anything.)
+    return tameUsernameColor(color, USERNAME_LUM_MAX_OUTLINE, USERNAME_LUM_MIN_OUTLINE);
 }
 
 // Twitch only puts the chatter's chosen colour on chat messages — event payloads

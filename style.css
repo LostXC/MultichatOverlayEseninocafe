@@ -682,25 +682,127 @@ a {
 	margin: 0px 0;
 }
 
-/* Contrast Outline Setting — chat messages only.
-   Scoped to #messageContainer so nothing inside bordered cards (which have
-   solid backgrounds) ever gets the outline: not the username, timestamp, or text. */
-.contrast-outline #messageContainer #message,
-.contrast-outline #messageContainer #replyMsg,
-.contrast-outline #messageContainer #timestamp {
-	-webkit-text-stroke: 2px #000000;
-	paint-order: stroke fill;
+/* ══ Contrast outline + 3D extrude ═══════════════════════════════════════════
+   Always on — no longer behind ?contrastOutline (the param is still parsed so old
+   browser-source URLs keep working, it just no longer gates anything). Scoped to
+   #messageContainer, so the bordered cards, which have their own solid white
+   backgrounds, are untouched.
+
+   Values and the JS half live in script.js under OUTLINE / the --o-* custom
+   properties; the long note there explains why the extrude is built from 1px
+   passes and why the icons use a mask union rather than a filter. */
+
+/* Registered so it inherits as a COMPUTED length. An unregistered custom property
+   is substituted as raw tokens and would re-resolve against each element's own
+   font-size, which made the outline thinner on #timestamp (0.888em) than on
+   #message — one number has to mean one thickness everywhere. */
+@property --o-hr { syntax: '<length>'; inherits: true; initial-value: 0.9px; }
+
+#messageContainer #message,
+#messageContainer #replyMsg,
+#messageContainer #timestamp,
+#messageContainer .name-mq .mq-inner,
+#messageContainer #replyUser {
+	text-shadow:
+		calc(var(--o-hr) * 1.000) calc(var(--o-hr) * 0.000) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.924) calc(var(--o-hr) * 0.383) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.707) calc(var(--o-hr) * 0.707) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.383) calc(var(--o-hr) * 0.924) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.000) calc(var(--o-hr) * 1.000) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.383) calc(var(--o-hr) * 0.924) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.707) calc(var(--o-hr) * 0.707) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.924) calc(var(--o-hr) * 0.383) 0 var(--o-colour),
+		calc(var(--o-hr) * -1.000) calc(var(--o-hr) * 0.000) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.924) calc(var(--o-hr) * -0.383) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.707) calc(var(--o-hr) * -0.707) 0 var(--o-colour),
+		calc(var(--o-hr) * -0.383) calc(var(--o-hr) * -0.924) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.000) calc(var(--o-hr) * -1.000) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.383) calc(var(--o-hr) * -0.924) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.707) calc(var(--o-hr) * -0.707) 0 var(--o-colour),
+		calc(var(--o-hr) * 0.924) calc(var(--o-hr) * -0.383) 0 var(--o-colour);
+	filter: var(--o-text-extrude, none);
 }
 
-/* Usernames get a tinted outline: a darker version of their own (enforced) color.
-   color-mix uses currentColor, so e.g. #FF0000 -> ~#610000. A name that is already
-   black mixes to black (no visible edge), but enforceContrast() lightens dark names
-   on dark backgrounds first, so that case only occurs when the name is already
-   legible on a light background. */
-.contrast-outline #messageContainer #username,
-.contrast-outline #messageContainer #replyUser {
-	-webkit-text-stroke: 2px color-mix(in srgb, currentColor, black 62%);
-	paint-order: stroke fill;
+/* Body copy goes white against the dark outline. Usernames keep their own colour
+   (tamed by usernameChatColor); the reply glyphs follow the body. */
+#messageContainer #message,
+#messageContainer #replyMsg { color: #ffffff; }
+#messageContainer #timestamp { color: #ffffff !important; }
+
+/* The username outline targets .name-mq .mq-inner, not #username: usernameMarquee()
+   replaces the #username span with <div class="mq fade name-mq">, so the old rule
+   never matched on a chat message and usernames went un-outlined entirely.
+
+   .mq's box hugs the name with zero slack and has overflow-x:clip, so the outline
+   was sliced off the first and last letter. Padding is the fix rather than
+   overflow-clip-margin, which Chromium does not honour reliably on an element with
+   mixed clip/visible overflow: overflow clips at the PADDING box, so this widens the
+   clip by construction. It also grows the border box — which is what the fade mask
+   is sized to — giving descenders room below the baseline. Negative margins keep the
+   name exactly where it was. */
+#messageContainer .mq {
+	padding: 0.5em 0.62em;
+	margin: -0.5em -0.62em;
+}
+
+/* #replyMsg is overflow:hidden on both axes (needed for text-overflow:ellipsis) with
+   no padding, so the clip box sat exactly on the text and cut the outline off the
+   first letter. Same padding trick, box widened so the text does not move.
+   Deliberately NO line-height change: raising it grows #replyUser and pushes the row
+   down, while #replyArrow is absolutely positioned and stays put. */
+#messageContainer #replyMsg {
+	padding-left: 0.62em;
+	margin-left: -0.62em;
+	width: calc(100% + 0.62em);
+	padding-bottom: 0.4em;
+	margin-bottom: -0.4em;
+}
+
+/* The reply arrow and line are masked background-colour shapes, so no text-shadow
+   reaches them. Both are a single stroked path in icons/reply-*.svg, so the outline
+   is just a second, wider stroke: one inline SVG draws the path twice, dark
+   underneath and light on top, round caps and joins on both. The element itself is
+   emptied and keeps only the extrude, matching the text's depth and direction. */
+#messageContainer #replyArrow,
+#messageContainer #replyLine {
+	background: none !important;
+	-webkit-mask: none !important;
+	        mask: none !important;
+	filter: var(--o-text-extrude, none);
+}
+#messageContainer #replyArrow::before,
+#messageContainer #replyLine::before {
+	content: '';
+	position: absolute;
+	inset: -3px;                 /* matches the padded viewBox in the data URI */
+	background-repeat: no-repeat;
+	background-position: center;
+	background-size: contain;
+}
+#messageContainer #replyArrow::before { background-image: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20width='20'%20height='20'%20viewBox='-3%20-3%2020%2020'><path%20d='M1.49996%201.5L1.49996%204.55263C1.5%207%203%208.52632%205.5%208.52632L11.9102%208.52632M8.95%205.05263L11.9102%208.52632L8.95%2012'%20fill='none'%20stroke='%23000'%20stroke-width='4.8'%20stroke-linecap='round'%20stroke-linejoin='round'/><path%20d='M1.49996%201.5L1.49996%204.55263C1.5%207%203%208.52632%205.5%208.52632L11.9102%208.52632M8.95%205.05263L11.9102%208.52632L8.95%2012'%20fill='none'%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%20stroke-linejoin='round'/></svg>"); }
+#messageContainer #replyLine::before  { background-image: url("data:image/svg+xml,<svg%20xmlns='http://www.w3.org/2000/svg'%20width='9'%20height='24'%20viewBox='-3%20-3%209%2024'><path%20d='M1.5%201.5V16.5'%20fill='none'%20stroke='%23000'%20stroke-width='4.8'%20stroke-linecap='round'%20stroke-linejoin='round'/><path%20d='M1.5%201.5V16.5'%20fill='none'%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%20stroke-linejoin='round'/></svg>"); }
+
+/* Badges and platform icons: silhouette is a mask union built by ApplyIconOutline()
+   in script.js. The wrapper inherits the image's margins and display mode there, so
+   nothing shifts off its baseline. */
+#messageContainer .o-ic { position: relative; flex-shrink: 0; }
+#messageContainer .o-ic > img { position: relative; z-index: 1; }
+
+/* Avatars: a full-bleed disc IS its border box, so a spread box-shadow traces it
+   exactly — no dilation needed, and multiple box-shadows do not chain. */
+#messageContainer .avatar,
+#messageContainer #avatar img {
+	box-shadow: var(--o-avatar-shadow, none);
+}
+
+/* --font-color now defaults to white for the outlined chat text, so pin the cards
+   back to black: several card descendants (.sub-card-content, .sub-user-row, .bits,
+   the music UI, #receiver-username) inherit their colour rather than setting it, and
+   would otherwise render white on a white card. */
+.sub-event-container,
+.music-ui-container,
+#card {
+	color: #000000;
 }
 
 /* ===== Music Info UI (Song Request) ===== */
