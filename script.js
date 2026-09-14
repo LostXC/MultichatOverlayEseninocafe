@@ -60,8 +60,10 @@ const boilStep = Math.max(0, Math.min(4, GetFloatParam("boilStep") ?? 0.178));
 
 const font = urlParams.get("font") || "";
 const fontSize = urlParams.get("fontSize") || "18";
-const fontColor = urlParams.get("fontColor") || "#ffffff";
 const contrastOutline = GetBooleanParam("contrastOutline", false);
+// White only makes sense against the outline. With the outline off this stays the
+// original black, so an overlay without ?contrastOutline looks exactly as it did.
+const fontColor = urlParams.get("fontColor") || (contrastOutline ? "#ffffff" : "#000000");
 const background = urlParams.get("background") || "#ffffff";
 const backgroundOpacity = GetIntParam("backgroundOpacity") ?? 100;
 
@@ -89,239 +91,180 @@ const stingersEnabled = GetBooleanParam("stingers", false);
 
 const showYouTubeMessages = GetBooleanParam("showYouTubeMessages", true);
 const showYouTubeSuperChats = GetBooleanParam("showYouTubeSuperChats", true);
-const showYouTubeSuperStickers = GetBooleanParam("showYouTubeSuperStickers", true);
 const showYouTubeMemberships = GetBooleanParam("showYouTubeMemberships", true);
 
 const showStreamlabsDonations = GetBooleanParam("showStreamlabsDonations", true);
 const showStreamElementsTips = GetBooleanParam("showStreamElementsTips", true);
-const showPatreon = GetBooleanParam("showPatreon", true);
-const showKofi = GetBooleanParam("showKofi", true);
-const showTipeeeStream = GetBooleanParam("showTipeeeStream", true);
-const showFourthwall = GetBooleanParam("showFourthwall", true);
-const showKickMessages = GetBooleanParam("showKickMessages", true);
-const showKickFollows = GetBooleanParam("showKickFollows", true);
-const showKickSubs = GetBooleanParam("showKickSubs", true);
-const showTikTokChat = GetBooleanParam("showTikTokChat", true);
-const showTikTokFollows = GetBooleanParam("showTikTokFollows", true);
-const showTikTokGifts = GetBooleanParam("showTikTokGifts", true);
-const showTikTokSubs = GetBooleanParam("showTikTokSubs", true);
 
 if (font) document.body.style.fontFamily = font;
 document.body.style.fontSize = `${fontSize}px`;
 document.documentElement.style.setProperty('--font-color', fontColor);
 if (contrastOutline) document.body.classList.add('contrast-outline');
 
-/* ══ Contrast outline + 3D extrude ═══════════════════════════════════════════
-   Always on — it is no longer behind ?contrastOutline. Chat messages only; the
-   bordered cards have their own solid backgrounds and are untouched.
+/* ── Reply arrow + line ──────────────────────────────────────────────────────
+   Drawn as an inline SVG per glyph rather than style.css's masked background, in
+   BOTH modes, because the mask was a latent bug: style.css masks them with
+   url(icons/reply-*.svg), and Chrome treats every file:// document as its own
+   opaque origin — so on a file:// browser source the mask is cross-origin, computes
+   to transparent, and the two glyphs vanish completely. An inline data: URI has no
+   origin to fail.
 
-   Four techniques, because four different kinds of shape:
-     text / usernames   16-copy text-shadow ring, then a filter extrude
-     reply arrow + line  one inline SVG drawing the path twice (wide dark, then light)
-     badges + platform   a mask UNION, built below
-     avatars             box-shadow rings (a disc IS its border box)
+   Each icon is a single stroked path, so with the outline on it is simply stroked
+   twice: wide in the outline colour underneath, then at its true 3px width in the
+   text colour. With the outline off it is the single 3px stroke in the text colour,
+   which is what the masked version looked like.
 
-   Two rasteriser facts drive the whole design:
-
-   1. Chained drop-shadow offsets are FLOORED to whole pixels. A fractional per-pass
-      offset therefore contributes nothing at all, and 1.01px through 1.99px all
-      contribute exactly one pixel. So the extrude is built as N passes of exactly
-      1px and the DEPTH is varied by changing N, not by scaling the offset.
-   2. Chained passes compose as a Minkowski sum, so ±1px in x and y makes a SQUARE
-      dilation whose corner pixel is a tooth on any 45° contour — and each extrude
-      pass then carries that tooth another pixel down. Mask layers under
-      mask-composite:add are a true union instead, with no compounding, and they
-      are not floored, so the ring can sample a real circle at fractional offsets
-      and a rounded corner comes out at radius R + r.                            */
-const OUTLINE = {
-	hrEm:     0.05,   // outline thickness, em
-	depthEm:  0.13,   // 3D extrude depth, em
-	imgScale: 1,      // extrude multiplier for badges / platform icons
-	avScale:  0.9,    // ...and for avatars: a full-bleed disc shows its whole
-	                  //    extrude as one crescent and reads deeper than it measures
-	dirX: 0, dirY: 1, // straight down
-	colour: '#000000',
-	ringPoints: 12,   // 12 is where the polygon stops reading as a polygon at icon size
-};
-
-const _oFs    = Number(fontSize) || 18;
-const _oHr    = Math.max(0.5, OUTLINE.hrEm * _oFs);
-const _oDepth = OUTLINE.depthEm * _oFs;
-
-// N passes of exactly 1px, walking integer positions along the direction vector.
-function BuildExtrudeFilter(totalPx) {
-	const n = Math.round(totalPx);
-	if (n < 1) return 'none';
-	const tx = OUTLINE.dirX * totalPx, ty = OUTLINE.dirY * totalPx;
-	const out = [];
-	let px = 0, py = 0;
-	for (let k = 1; k <= n; k++) {
-		const qx = Math.round(tx * k / n), qy = Math.round(ty * k / n);
-		if (qx - px || qy - py) out.push(`drop-shadow(${qx - px}px ${qy - py}px 0 ${OUTLINE.colour})`);
-		px = qx; py = qy;
-	}
-	return out.length ? out.join(' ') : 'none';
-}
-
-const _oRoot = document.documentElement.style;
-_oRoot.setProperty('--o-hr', _oHr + 'px');
-_oRoot.setProperty('--o-colour', OUTLINE.colour);
-_oRoot.setProperty('--o-text-extrude', BuildExtrudeFilter(_oDepth));
+   Colours come from fontColor and the outline width from --o-hr, so these follow
+   ?fontColor= instead of being hardcoded. The viewBox is padded by 3 on each side
+   (::before is inset -3px to match) so the wide stroke has room without moving the
+   glyph off where style.css positions it. */
 {
-	// avatar: a ring plus three offset rings, unioned. box-shadows are all drawn from
-	// the element rather than chained, so they keep sub-pixel precision.
-	const step = _oDepth * OUTLINE.avScale / 3, dx = OUTLINE.dirX, dy = OUTLINE.dirY;
-	const rings = [1, 2, 3].map(k =>
-		`${(dx * step * k).toFixed(3)}px ${(dy * step * k).toFixed(3)}px 0 var(--o-hr) ${OUTLINE.colour}`);
-	_oRoot.setProperty('--o-avatar-shadow', `0 0 0 var(--o-hr) ${OUTLINE.colour}, ` + rings.join(', '));
+	const _rHr = contrastOutline ? Math.max(0.5, 0.05 * (Number(fontSize) || 18)) : 0;
+	const _rOw = (3 + 2 * _rHr).toFixed(2);
+	const _rSvg = (w, h, vb, d) =>
+		'url("data:image/svg+xml,' + encodeURIComponent(
+			`<svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}' viewBox='${vb}'>` +
+			(_rHr > 0
+				? `<path d='${d}' fill='none' stroke='#000000' stroke-width='${_rOw}' stroke-linecap='round' stroke-linejoin='round'/>`
+				: '') +
+			`<path d='${d}' fill='none' stroke='${fontColor}' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/>` +
+			`</svg>`) + '")';
+	document.documentElement.style.setProperty('--o-reply-arrow', _rSvg(20, 20, '-3 -3 20 20',
+		'M1.49996 1.5L1.49996 4.55263C1.5 7 3 8.52632 5.5 8.52632L11.9102 8.52632M8.95 5.05263L11.9102 8.52632L8.95 12'));
+	document.documentElement.style.setProperty('--o-reply-line', _rSvg(9, 24, '-3 -3 9 24', 'M1.5 1.5V16.5'));
 }
 
-/* Badges and platform icons are <img>, so no text-shadow and no SVG stroke is
-   available. The silhouette is one masked element carrying the icon repeated at
-   every offset in (circle ⊕ extrude segment), painted flat, with the real icon on
-   top. The offsets never change once the settings are read, so the layer strings
-   are built once here rather than per icon. */
-const _oIconStyle = (() => {
-	const r = _oHr, total = _oDepth * OUTLINE.imgScale;
-	const ring = [[0, 0]];
-	for (let i = 0; i < OUTLINE.ringPoints; i++) {
-		const a = (i / OUTLINE.ringPoints) * Math.PI * 2;
-		ring.push([+(Math.cos(a) * r).toFixed(3), +(Math.sin(a) * r).toFixed(3)]);
-	}
-	const steps = Math.max(1, Math.ceil(total));
-	const seg = [];
-	for (let k = 0; k <= steps; k++) {
-		const t = total * k / steps;
-		seg.push([+(OUTLINE.dirX * t).toFixed(3), +(OUTLINE.dirY * t).toFixed(3)]);
-	}
-	const seen = new Set(), offs = [];
-	for (const [ax, ay] of ring) for (const [bx, by] of seg) {
-		const x = +(ax + bx).toFixed(3), y = +(ay + by).toFixed(3), key = x + ',' + y;
-		if (!seen.has(key)) { seen.add(key); offs.push([x, y]); }
-	}
-	return {
-		offs,
-		pad: Math.ceil(r + total + 1),
-		position: offs.map(([x, y]) => `calc(50% + ${x}px) calc(50% + ${y}px)`).join(','),
-	};
-})();
+/* The extrude chain, still carrying its unresolved var(--o-colour).
 
-/* Alpha-threshold the mask source.
+   A custom property resolves the var()s inside its OWN value at the element where it
+   is declared — so the copy on :root bakes in root's black before it ever inherits.
+   Re-declaring this same string on a username element makes it resolve against that
+   element's --o-colour instead, which is how a name gets a 3D in its own ink. */
+let _oTextExtrudeTemplate = '';
 
-   mask-composite:add composites as a + b(1-a) per layer, so a pixel with even a
-   trace of alpha is driven towards opaque once ~50 layers overlap it: Twitch's
-   Prime badge has corner alpha 6/255, and 1 - (1 - 0.024)^52 is about 0.72. The
-   union therefore MANUFACTURES a solid corner out of a nearly invisible one, and
-   the outline squares off around a badge that looks rounded.
+if (contrastOutline) {
 
-   Kill the faint pixels before they are ever unioned. The ramp keeps a soft edge
-   where the artwork genuinely is soft (mid alphas pass through, rescaled) and
-   zeroes everything under the low mark, which is the halo that was building up.
+	/* ══ Contrast outline + 3D extrude ═══════════════════════════════════════════
+	   Behind ?contrastOutline, and chat messages only; the bordered cards have their
+	   own solid backgrounds and are untouched.
 
-   Object URLs, not data URLs: the mask-image list repeats the source once per
-   layer, and 52 copies of a base64 PNG would be ~100KB of inline CSS per icon.
+	   Four techniques, because four different kinds of shape:
+	     text / usernames   16-copy text-shadow ring, then a filter extrude
+	     reply arrow + line  one inline SVG drawing the path twice (wide dark, then light)
+	     badges + platform   one SVG filter: blur SourceAlpha, threshold it, merge
+	     avatars             box-shadow rings (a disc IS its border box)
 
-   Falls back to the untouched src if the canvas is tainted or the image fails, so
-   a CDN without CORS headers degrades to the previous behaviour rather than
-   losing its outline. Cached per src — each badge is processed once per session.
+	   Two rasteriser facts drive the whole design:
 
-   NOTE: this reads pixels, so it needs a second CORS fetch of each badge.
-   static-cdn.jtvnw.net sends access-control-allow-origin:*, so it works today. */
-const _oMaskCache = new Map();
-function ThresholdedMask(src) {
-	if (_oMaskCache.has(src)) return _oMaskCache.get(src);
-	const job = new Promise(resolve => {
-		const im = new Image();
-		im.crossOrigin = 'anonymous';
-		im.onerror = () => resolve(null);
-		im.onload = () => {
-			try {
-				const c = document.createElement('canvas');
-				c.width = im.naturalWidth; c.height = im.naturalHeight;
-				const g = c.getContext('2d', { willReadFrequently: false });
-				g.drawImage(im, 0, 0);
-				const data = g.getImageData(0, 0, c.width, c.height);
-				const px = data.data, LO = 90, HI = 190;   // ~0.35 and ~0.75 of 255
-				for (let i = 3; i < px.length; i += 4) {
-					const a = px[i];
-					px[i] = a <= LO ? 0 : a >= HI ? 255 : Math.round(255 * (a - LO) / (HI - LO));
-				}
-				g.putImageData(data, 0, 0);
-				c.toBlob(b => resolve(b ? URL.createObjectURL(b) : null), 'image/png');
-			} catch (e) { resolve(null); }        // tainted canvas
-		};
-		im.src = src;
-	});
-	_oMaskCache.set(src, job);
-	return job;
-}
-
-function ApplyIconOutline(img) {
-	if (!img || img.dataset.oDone === '1') return;
-	const ci = getComputedStyle(img);
-	const iw = img.naturalWidth, ih = img.naturalHeight;
-	if (!iw || !ih) {                       // not decoded yet — come back on load
-		img.addEventListener('load', () => ApplyIconOutline(img), { once: true });
-		return;
-	}
-	img.dataset.oDone = '1';
-
-	let wrap = img.closest('.o-ic');
-	if (!wrap) {
-		wrap = document.createElement('span');
-		wrap.className = 'o-ic';
-		img.parentNode.insertBefore(wrap, img);
-		wrap.appendChild(document.createElement('span')).className = 'o-ic-sil';
-		wrap.appendChild(img);
-		// style.css puts the spacing margins and the display mode on the IMG itself
-		// (.platform is display:flex + margin-left:7px), so the wrapper has to take
-		// both or the icon shifts off its baseline and the silhouette box is wrong.
-		wrap.style.margin = `${ci.marginTop} ${ci.marginRight} ${ci.marginBottom} ${ci.marginLeft}`;
-		wrap.style.display = ci.display === 'inline' ? 'inline-block' : ci.display;
-		wrap.style.verticalAlign = ci.verticalAlign;
-		img.style.margin = '0';
-	}
-
-	// object-fit:contain leaves very little slack inside the icon's own box, so the
-	// silhouette is padded by the full reach and the mask pinned to an explicit size
-	// (mask-size:contain would rescale when the box grows). The padded box stays
-	// concentric, so 50% still centres where object-fit put the image.
-	const bw = parseFloat(ci.width), bh = parseFloat(ci.height);
-	const k = Math.min(bw / iw, bh / ih);
-	const size = `${(iw * k).toFixed(2)}px ${(ih * k).toFixed(2)}px`;
-	const src = img.getAttribute('src');
-	const n = _oIconStyle.offs.length;
-	const sil = wrap.querySelector('.o-ic-sil');
-
-	const paint = (maskSrc) => {
-		const url = `url("${maskSrc}")`;
-		sil.style.cssText =
-			`position:absolute;inset:${-_oIconStyle.pad}px;pointer-events:none;` +
-			`background:${OUTLINE.colour};` +
-			`-webkit-mask-image:${Array(n).fill(url).join(',')};mask-image:${Array(n).fill(url).join(',')};` +
-			`-webkit-mask-position:${_oIconStyle.position};mask-position:${_oIconStyle.position};` +
-			`-webkit-mask-size:${Array(n).fill(size).join(',')};mask-size:${Array(n).fill(size).join(',')};` +
-			`-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;` +
-			`-webkit-mask-composite:source-over;mask-composite:add;`;
+	   1. Chained drop-shadow offsets are FLOORED to whole pixels. A fractional per-pass
+	      offset therefore contributes nothing at all, and 1.01px through 1.99px all
+	      contribute exactly one pixel. So the extrude is built as N passes of exactly
+	      1px and the DEPTH is varied by changing N, not by scaling the offset.
+	   2. Chained passes compose as a Minkowski sum, so ±1px in x and y makes a SQUARE
+	      dilation whose corner pixel is a tooth on any 45° contour — and each extrude
+	      pass then carries that tooth another pixel down. This is only a problem for a
+	      RING; the extrude itself runs straight down (dirX 0), and a Minkowski sum with
+	      a vertical segment is just a vertical sweep, so it stays exact. Rings are
+	      therefore built some other way per shape — never by chaining.               */
+	const OUTLINE = {
+		hrEm:     0.05,   // outline thickness, em
+		depthEm:  0.13,   // 3D extrude depth, em
+		imgScale: 1,      // extrude multiplier for badges / platform icons
+		avScale:  0.9,    // ...and for avatars: a full-bleed disc shows its whole
+		                  //    extrude as one crescent and reads deeper than it measures
+		dirX: 0, dirY: 1, // straight down
+		colour: '#000000',
 	};
 
-	paint(src);                                   // show something immediately...
-	ThresholdedMask(src).then(u => { if (u) paint(u); });   // ...then sharpen the corners
-}
+	const _oFs    = Number(fontSize) || 18;
+	const _oHr    = Math.max(0.5, OUTLINE.hrEm * _oFs);
+	const _oDepth = OUTLINE.depthEm * _oFs;
 
-// Icons arrive with each message, so outline them as they land.
-new MutationObserver(muts => {
-	for (const m of muts) for (const node of m.addedNodes) {
-		if (node.nodeType !== 1) continue;
-		if (node.matches && node.matches('#messageContainer #platform img, #messageContainer #badgeList img'))
-			ApplyIconOutline(node);
-		if (node.querySelectorAll)
-			node.querySelectorAll('#messageContainer #platform img, #messageContainer #badgeList img')
-				.forEach(ApplyIconOutline);
+	// N passes of exactly 1px, walking integer positions along the direction vector.
+	function BuildExtrudeFilter(totalPx) {
+		const n = Math.round(totalPx);
+		if (n < 1) return 'none';
+		const tx = OUTLINE.dirX * totalPx, ty = OUTLINE.dirY * totalPx;
+		const out = [];
+		let px = 0, py = 0;
+		for (let k = 1; k <= n; k++) {
+			const qx = Math.round(tx * k / n), qy = Math.round(ty * k / n);
+			// var() rather than the literal: the colour is resolved on the element that
+			// uses the filter, so a username carrying its own --o-colour gets a 3D in
+			// its own ink while everything else falls back to the global one.
+			if (qx - px || qy - py) out.push(`drop-shadow(${qx - px}px ${qy - py}px 0 var(--o-colour, ${OUTLINE.colour}))`);
+			px = qx; py = qy;
+		}
+		return out.length ? out.join(' ') : 'none';
 	}
-// (queried directly: `const messageList` is declared further down this file, so
-//  referencing it here would hit the temporal dead zone.)
-}).observe(document.getElementById('messageList'), { childList: true, subtree: true });
+
+	const _oRoot = document.documentElement.style;
+	_oRoot.setProperty('--o-hr', _oHr + 'px');
+	_oRoot.setProperty('--o-colour', OUTLINE.colour);
+	_oTextExtrudeTemplate = BuildExtrudeFilter(_oDepth);
+	_oRoot.setProperty('--o-text-extrude', _oTextExtrudeTemplate);
+	{
+		// avatar: a ring plus three offset rings, unioned. box-shadows are all drawn from
+		// the element rather than chained, so they keep sub-pixel precision.
+		const step = _oDepth * OUTLINE.avScale / 3, dx = OUTLINE.dirX, dy = OUTLINE.dirY;
+		const rings = [1, 2, 3].map(k =>
+			`${(dx * step * k).toFixed(3)}px ${(dy * step * k).toFixed(3)}px 0 var(--o-hr) ${OUTLINE.colour}`);
+		_oRoot.setProperty('--o-avatar-shadow', `0 0 0 var(--o-hr) ${OUTLINE.colour}, ` + rings.join(', '));
+	}
+
+	/* Badges and platform icons are <img>: no text-shadow, no SVG stroke, and a
+	   chained drop-shadow ring dilates into a SQUARE. This used to be solved by
+	   painting the icon 52 times under mask-composite:add — a union of offset copies.
+	   It worked, but a union of COPIES is a polygon approximation of a circle, and at
+	   badge size the individual copies read as lumps along the contour; alpha
+	   thresholding, a layer budget and a CORS pixel read were all scaffolding around
+	   that one idea.
+
+	   feGaussianBlur on SourceAlpha is a distance field, so thresholding the blur at a
+	   fixed alpha gives a TRUE circular dilation — one exact contour instead of 52
+	   samples of one, and the corner radius follows the corner for free. Threshold
+	   level p sits at distance sigma * sqrt(2) * erfc-inverse(2p) outside the edge;
+	   at p = 0.15 that is sigma * 1.0365, so sigma = r / 1.0365 puts the outline
+	   exactly where the ring used to be. The ramp is deliberately not a hard step —
+	   its width is the antialiasing.
+
+	   The extrude stays a chained drop-shadow. Chaining is only a problem because it
+	   composes as a Minkowski sum, and a sum with a purely VERTICAL segment is just a
+	   vertical sweep — the 45-degree tooth needs a diagonal to appear, and dirX is 0.
+
+	   Being a filter rather than a mask, this also needs no second fetch of the icon,
+	   so it survives a tainted canvas and works on file:// — the two cases the mask
+	   path had to carve out. */
+	{
+		const P = 0.15;                          // threshold level -> dilation distance
+		const sigma = _oHr / 1.0365;
+		const slope = 12, intercept = 0.5 - slope * P;
+		const ns = 'http://www.w3.org/2000/svg';
+		const svg = document.createElementNS(ns, 'svg');
+		svg.setAttribute('width', '0'); svg.setAttribute('height', '0');
+		svg.setAttribute('aria-hidden', 'true');
+		svg.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden';
+		// The region has to hold the outline plus the extrude; 70% of an icon box is
+		// several times the ~3px reach, and a bigger region only costs fill rate.
+		svg.innerHTML =
+			`<filter id="o-icon-outline" x="-70%" y="-70%" width="240%" height="240%" ` +
+			`color-interpolation-filters="sRGB">` +
+			`<feGaussianBlur in="SourceAlpha" stdDeviation="${sigma.toFixed(3)}"/>` +
+			`<feComponentTransfer result="o-ring">` +
+			`<feFuncA type="linear" slope="${slope}" intercept="${intercept.toFixed(3)}"/>` +
+			`</feComponentTransfer>` +
+			// feFlood keeps OUTLINE.colour meaningful — SourceAlpha alone is always black.
+			`<feFlood flood-color="${OUTLINE.colour}"/>` +
+			`<feComposite in2="o-ring" operator="in" result="o-out"/>` +
+			`<feMerge><feMergeNode in="o-out"/><feMergeNode in="SourceGraphic"/></feMerge>` +
+			`</filter>`;
+		document.body.appendChild(svg);
+
+		const ex = BuildExtrudeFilter(_oDepth * OUTLINE.imgScale);
+		_oRoot.setProperty('--o-img-outline', 'url(#o-icon-outline)' + (ex === 'none' ? '' : ' ' + ex));
+	}
+
+}   // end if (contrastOutline)
 
 
 const mainContainer = document.getElementById('mainContainer');
@@ -366,30 +309,12 @@ client.on('Twitch.SharedChatUserTimedout', (data) => TwitchUserBanned(data.data)
 
 client.on('YouTube.Message', (data) => YouTubeMessage(data.data));
 client.on('YouTube.SuperChat', (data) => YouTubeSuperChat(data.data));
-client.on('YouTube.SuperSticker', (data) => YouTubeSuperSticker(data.data));
 client.on('YouTube.NewSponsor', (data) => YouTubeNewSponsor(data.data));
 client.on('YouTube.MembershipGift', (data) => YouTubeGiftMembershipReceived(data.data));
 
 client.on('Streamlabs.Donation', (data) => StreamlabsDonation(data.data));
 client.on('StreamElements.Tip', (data) => StreamElementsTip(data.data));
 
-client.on('Patreon.PledgeCreated', (data) => PatreonPledgeCreated(data.data));
-client.on('Kofi.Donation', (data) => KofiDonation(data.data));
-client.on('Kofi.Subscription', (data) => KofiSubscription(data.data));
-client.on('Kofi.Resubscription', (data) => KofiResubscription(data.data));
-client.on('Kofi.ShopOrder', (data) => KofiShopOrder(data.data));
-client.on('TipeeeStream.Donation', (data) => TipeeeStreamDonation(data.data));
-client.on('Fourthwall.OrderPlaced', (data) => FourthwallOrderPlaced(data.data));
-client.on('Fourthwall.Donation', (data) => FourthwallDonation(data.data));
-client.on('Fourthwall.SubscriptionPurchased', (data) => FourthwallSubscriptionPurchased(data.data));
-client.on('Fourthwall.GiftPurchase', (data) => FourthwallGiftPurchase(data.data));
-client.on('Fourthwall.GiftDrawStarted', (data) => FourthwallGiftDrawStarted(data.data));
-client.on('Fourthwall.GiftDrawEnded', (data) => FourthwallGiftDrawEnded(data.data));
-
-client.on('Kick.ChatMessage', (data) => KickChatMessage(data.data));
-client.on('Kick.Follow', (data) => KickFollow(data.data));
-client.on('Kick.Subscription', (data) => KickSubscription(data.data));
-client.on('Kick.GiftedSubscriptions', (data) => KickGiftedSubscriptions(data.data));
 
 const avatarMap = new Map();
 
@@ -397,12 +322,6 @@ const avatarMap = new Map();
 const PLATFORM_COLORS = {
 	twitch: '#A644FF',
 	youtube: '#FF0000',
-	kick: '#53FC18',
-	tiktok: '#FF0050',
-	patreon: '#FF424D',
-	kofi: '#13C3FF',
-	tipeeeStream: '#E2236F',
-	fourthwall: '#1C56F5',
 	streamlabs: '#80F5D2',
 	streamelements: '#5599FF',
 };
@@ -410,7 +329,7 @@ function GetPlatformColor(platform) {
 	return PLATFORM_COLORS[platform] || '#A644FF';
 }
 // Platforms that have an icon file in icons/platforms/. Others skip the platform badge.
-const PLATFORMS_WITH_ICONS = new Set(['twitch', 'youtube', 'kick', 'tiktok', 'patreon', 'kofi', 'tipeeeStream']);
+const PLATFORMS_WITH_ICONS = new Set(['twitch', 'youtube']);
 
 function SetConnectionStatus(connected) {
 	let statusContainer = document.getElementById("statusContainer");
@@ -444,37 +363,49 @@ function hexToRgba(hex, alpha) {
 // is nudged slightly lighter so it stays visible over dark footage. Raise/lower these
 // to widen or narrow the "safe" luminance band.
 const USERNAME_LUM_MAX = 0.55;         // names brighter than this get darkened down to it
-const USERNAME_LUM_MAX_OUTLINE = 0.8;  // gentler cap when the outline is on (less darkening)
+const USERNAME_LUM_MAX_OUTLINE = 0.65; // gentler cap when the outline is on (less darkening)
 const USERNAME_LUM_MIN = 0.04;         // names darker than this get lightened up to it
-const USERNAME_LUM_MIN_OUTLINE = 0.10; // higher floor when the outline is on (a bit lighter)
-function tameUsernameColor(color, maxLum = USERNAME_LUM_MAX, minLum = USERNAME_LUM_MIN) {
+const USERNAME_LUM_MIN_OUTLINE = 0.05; // higher floor when the outline is on (a bit lighter)
+const USERNAME_INK_KEEP = 0.91;        // measured: what the tinted ring leaves of the colour
+const USERNAME_INK_SCALE = 0.25;       // outline ink = the name's own colour, this much of it
+/* The outline ring is painted BEHIND the glyph, so the antialiased edges blend into it
+   and the eye integrates a slightly darker colour than the nominal one — at chat size
+   more than half the glyph is edge. Measured over the glyph's own coverage (halo
+   excluded): a black ring keeps 87.8% of the colour, a 0.25x tinted ring 90.9%.
+
+   The band is about what you SEE, so `keep` folds that loss into the comparison: the
+   colour is judged as it lands on screen, not as it arrives. With the outline off it
+   is 1 and nothing changes. */
+function tameUsernameColor(color, maxLum = USERNAME_LUM_MAX, minLum = USERNAME_LUM_MIN, keep = 1) {
     if (!color || !color.startsWith('#')) return color;
     const parseHex = h => { h = h.replace('#',''); if (h.length===3) h=h[0]+h[0]+h[1]+h[1]+h[2]+h[2]; return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)]; };
     const toLinear = c => { const s=c/255; return s<=0.03928 ? s/12.92 : Math.pow((s+0.055)/1.055, 2.4); };
     const lum = (r,g,b) => 0.2126*toLinear(r) + 0.7152*toLinear(g) + 0.0722*toLinear(b);
     const [r,g,b] = parseHex(color);
-    const L = lum(r,g,b);
+    const seen = (r,g,b) => lum(r*keep, g*keep, b*keep);   // what actually reaches the eye
+    const L = seen(r,g,b);
     if (L > maxLum) {
-        let f=1.0; while (lum(r*f,g*f,b*f) > maxLum && f>0.05) f-=0.02;
+        let f=1.0; while (seen(r*f,g*f,b*f) > maxLum && f>0.05) f-=0.02;
         return `rgb(${Math.round(r*f)}, ${Math.round(g*f)}, ${Math.round(b*f)})`;
     }
     if (L < minLum) {
-        let t=0; while (lum(r+(255-r)*t, g+(255-g)*t, b+(255-b)*t) < minLum && t<0.95) t+=0.02;
+        let t=0; while (seen(r+(255-r)*t, g+(255-g)*t, b+(255-b)*t) < minLum && t<0.95) t+=0.02;
         return `rgb(${Math.round(r+(255-r)*t)}, ${Math.round(g+(255-g)*t)}, ${Math.round(b+(255-b)*t)})`;
     }
     return color;
 }
 
-// Username colour for chat messages. Chat always has the outline now, so it always
-// takes the gentler band — a less aggressive bright cap and a higher dark floor,
-// because the dark stroke is doing the contrast work. Event cards still call
-// tameUsernameColor() with the default (stricter) band, since they sit on solid white.
+// THE username colour entry point — chat lines, event cards and featured messages all
+// come through here, so a name is the same colour however it reaches the screen. Event
+// cards used to call tameUsernameColor() bare, which pinned them to the stricter band
+// no matter what, and that is exactly the mismatch this removes.
 function usernameChatColor(color) {
-    // The outline is always on now, so always use the gentler band: the dark stroke
-    // is providing the contrast, so bright names need less darkening and dark names
-    // less lightening. (?contrastOutline is still read for backwards compatibility
-    // with existing browser-source URLs, but no longer gates anything.)
-    return tameUsernameColor(color, USERNAME_LUM_MAX_OUTLINE, USERNAME_LUM_MIN_OUTLINE);
+    // With the outline on, the dark stroke supplies the contrast, so bright names
+    // need less darkening and dark names less lightening. Without it, fall back to
+    // the stricter band the overlay used before.
+    return contrastOutline
+        ? tameUsernameColor(color, USERNAME_LUM_MAX_OUTLINE, USERNAME_LUM_MIN_OUTLINE, USERNAME_INK_KEEP)
+        : tameUsernameColor(color, USERNAME_LUM_MAX, USERNAME_LUM_MIN);
 }
 
 // Twitch only puts the chatter's chosen colour on chat messages — event payloads
@@ -515,6 +446,86 @@ function FetchTwitchColor(login) {
 	return p;
 }
 
+// Session cheer tally, for the custom bit badge in chat. Bits are counted for this
+// overlay session only — reloading the browser source (every scene restart) puts
+// everyone back to zero, which is the point: it reads "cheered this stream". Keyed the
+// same way as the colour map so a cheer payload and a chat payload find each other.
+const twitchBitsMap = new Map();
+// Twitch's own gem tiers, highest first — shared by the badge and the cheer card.
+const BIT_TIERS = [[10000, 'red'], [5000, 'blue'], [1000, 'green'], [100, 'purple'], [1, 'gray']];
+
+// Every alias of one chatter points at the SHARED record, so a cheer that only carries
+// a login and a chat message that only carries a user id can't drift apart. Seeing a new
+// alias merges whatever records it already touched into one.
+function AddTwitchBits(bits, ...keys) {
+	const n = Math.floor(Number(bits)) || 0;
+	if (n <= 0) return;
+	const ks = keys.filter(Boolean).map(k => String(k).toLowerCase());
+	if (!ks.length) return;
+	const rec = { total: n, keys: new Set(ks) };
+	new Set(ks.map(k => twitchBitsMap.get(k)).filter(Boolean)).forEach(old => {
+		rec.total += old.total;
+		old.keys.forEach(k => rec.keys.add(k));
+	});
+	rec.keys.forEach(k => twitchBitsMap.set(k, rec));
+}
+
+function LookupTwitchBits(...keys) {
+	for (const k of keys) {
+		if (!k) continue;
+		const hit = twitchBitsMap.get(String(k).toLowerCase());
+		if (hit) return hit.total;
+	}
+	return 0;
+}
+
+// Event payloads (sub, cheer, raid, follow) carry no chat badges — the same gap that
+// forced twitchColorMap, so it gets the same treatment: remember what a user wore in
+// chat and reuse it on their cards. Someone whose first appearance IS the event has
+// nothing remembered yet and simply shows no badges.
+const twitchBadgeMap = new Map();
+
+function RememberTwitchBadges(badges, ...keys) {
+	if (!Array.isArray(badges) || !badges.length) return;
+	keys.forEach(k => { if (k) twitchBadgeMap.set(String(k).toLowerCase(), badges); });
+}
+
+function LookupTwitchBadges(...keys) {
+	for (const k of keys) {
+		if (!k) continue;
+		const hit = twitchBadgeMap.get(String(k).toLowerCase());
+		if (hit) return hit;
+	}
+	return [];
+}
+
+// The one place badges become <img>s — chat and cards share it so the bits filter and
+// the ordering can't drift apart.
+function RenderBadgeList(div, badges) {
+	if (!div) return;
+	div.innerHTML = '';
+	(badges || []).filter(b => b && b.imageUrl && !IsTwitchBitsBadge(b)).forEach(b => {
+		const img = new Image(); img.src = b.imageUrl; img.classList.add('badge');
+		div.appendChild(img);
+	});
+}
+
+// Twitch's own Bits badge is the SAME gem art and the SAME tier colours as the session
+// badge (icons/bit-*.svg are that artwork), so a cheerer would carry two near-identical
+// gems — Twitch's lifetime one and this stream's. Drop Twitch's and keep ours.
+// Matched on the value rather than a field name: Streamer.bot's badge objects are not
+// documented here, and the set id is the string "bits" whichever key carries it. A badge
+// we fail to recognise simply still renders, which is the old behaviour.
+function IsTwitchBitsBadge(b) {
+	return !!b && Object.values(b).some(v => typeof v === 'string' && v.toLowerCase() === 'bits');
+}
+
+// null below 1 bit — no badge for someone who hasn't cheered.
+function BitTierColor(bits) {
+	const tier = BIT_TIERS.find(([min]) => bits >= min);
+	return tier ? tier[1] : null;
+}
+
 // Colour for a username on an event card: an explicit override wins, then whatever the
 // payload carried, then the remembered/looked-up Twitch chat colour, then the platform.
 async function EventUserColor(user, platform, override) {
@@ -544,7 +555,14 @@ async function renderFeaturedMessage(data, headerText, platform) {
 	const featuredColor = platform === 'twitch'
 		? await EventUserColor({ ...data.user, color: data.user?.color || data.message?.color }, 'twitch')
 		: '#FF0000';
-	usernameSpan.replaceWith(usernameMarquee(data.user.name, tameUsernameColor(featuredColor)));
+	usernameSpan.replaceWith(usernameMarquee(data.user.name, usernameChatColor(featuredColor)));
+
+	// The template has always had a #badgeList; nothing ever filled it. A featured
+	// message IS a chat message, so its own payload carries the badges.
+	if (showBadges && platform === 'twitch') {
+		RenderBadgeList(instance.querySelector("#badgeList"),
+			data.message?.badges || LookupTwitchBadges(data.user?.id, data.user?.login, data.user?.name));
+	}
 
 	if (data.user.name !== 'Anonymous') {
 		const avatarUrl = await GetAvatar(data.user.name, data.user.profileImageUrl, platform);
@@ -629,7 +647,7 @@ async function renderEventCard(data, type, platform, opts = {}) {
 
 	if (showUsername) {
 		usernameDiv.textContent = senderName;
-		usernameDiv.style.color = tameUsernameColor(await EventUserColor(data.user, platform, opts.color));
+		usernameDiv.style.color = usernameChatColor(await EventUserColor(data.user, platform, opts.color));
 		if (senderName === 'Anonymous') usernameDiv.classList.add('is-anonymous');
 	}
 
@@ -648,6 +666,14 @@ async function renderEventCard(data, type, platform, opts = {}) {
 		avatarDiv.style.display = 'none';
 	}
 	
+	// Badges from what this user last wore in chat. Skipped on an individual gift: that
+	// row already carries two users (sender -> receiver) and whose badges these were
+	// would be ambiguous.
+	if (showBadges && platform === 'twitch' && !isIndividualGift && !data.isAnonymous) {
+		RenderBadgeList(instance.querySelector("#badgeList"),
+			LookupTwitchBadges(data.user?.id, data.user?.login, data.user?.name, data.user?.displayName));
+	}
+
 	if (isIndividualGift) {
 		const subUserContent = instance.querySelector(".sub-user-content");
 		const receiverSpan = instance.querySelector("#gift-receiver");
@@ -663,8 +689,8 @@ async function renderEventCard(data, type, platform, opts = {}) {
 
 			// Sender + receiver names become scrolling marquees that split the row's
 			// width by max-min fairness (allocateGiftRow), replacing the old ellipsis.
-			const senderColor = tameUsernameColor(await EventUserColor(data.user, platform, opts.color));
-			const receiverColor = tameUsernameColor(await EventUserColor(data.recipient, platform, opts.color));
+			const senderColor = usernameChatColor(await EventUserColor(data.user, platform, opts.color));
+			const receiverColor = usernameChatColor(await EventUserColor(data.recipient, platform, opts.color));
 			const senderText = showUsername ? senderName : '';
 
 			// Wrap the sender's avatar · platform · name into one flex cell.
@@ -704,9 +730,6 @@ async function renderEventCard(data, type, platform, opts = {}) {
 				break;
 			case 'giftbomb':
 				description = platform === 'twitch' ? `Gifted ${data.giftCount} Tier ${String(data.subTier || '1').charAt(0)} Subs to the Community` : `Gifted ${data.giftCount} Memberships to the Community`;
-				break;
-			case 'member':
-				description = `Became a Channel Member!`;
 				break;
 			case 'raid':
 				description = `Raiding with a Party of ${data.viewers} ${data.viewers === 1 ? 'Homie' : 'Homies'}`;
@@ -766,6 +789,7 @@ async function TwitchChatMessage(data) {
 	// Learn this chatter's colour before any early return, so event cards for people
 	// whose messages we hide (commands, ignored users) still get the right colour.
 	RememberTwitchColor(data.message?.color, data.message?.userId, data.message?.username, data.message?.displayName, data.user?.id, data.user?.login, data.user?.name);
+	RememberTwitchBadges(data.message?.badges, data.message?.userId, data.message?.username, data.message?.displayName, data.user?.id, data.user?.login, data.user?.name);
 	if (data.message?.firstMessage) return await renderFeaturedMessage(data, "FIRST TIME CHAT", 'twitch');
 	if (!showTwitchMessages || (data.message.message.startsWith("!") && excludeCommands) || ignoreUserList.includes(data.message.username)) return;
 
@@ -777,7 +801,13 @@ async function TwitchChatMessage(data) {
 		replyDiv.style.display = 'flex';
 		const replyUserDiv = instance.querySelector("#replyUser");
 		replyUserDiv.innerText = data.message.reply.userName;
-		replyUserDiv.style.color = usernameChatColor('#A644FF');
+		const rc = usernameChatColor('#A644FF');
+		replyUserDiv.style.color = rc;
+		const rInk = usernameInk(rc);
+		if (rInk) {
+			replyUserDiv.style.setProperty('--o-colour', rInk);
+			if (_oTextExtrudeTemplate) replyUserDiv.style.setProperty('--o-text-extrude', _oTextExtrudeTemplate);
+		}
 		instance.querySelector("#replyMsg").innerText = data.message.reply.msgBody;
 	} else if (replyDiv) {
 		replyDiv.remove();
@@ -790,7 +820,12 @@ async function TwitchChatMessage(data) {
 		// cropped and scrolled instead of running off the row and shoving the
 		// timestamp out of view.
 		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.replaceWith(usernameMarquee(data.message.displayName, usernameChatColor(data.message.color)));
+		// A chatter who never picked a colour arrives with an empty string. Left as-is
+		// the name inherits --font-color and renders white — indistinguishable from the
+		// message text — while that same person's event card falls back to the platform
+		// purple. Use the card's fallback here so one user is one colour everywhere.
+		usernameDiv.replaceWith(usernameMarquee(data.message.displayName,
+			usernameChatColor(data.message.color || GetPlatformColor('twitch'))));
 	}
 
 	const messageDiv = instance.querySelector("#message");
@@ -805,11 +840,14 @@ async function TwitchChatMessage(data) {
 
 	if (showBadges) {
 		const badgeListDiv = instance.querySelector("#badgeList");
-		badgeListDiv.innerHTML = "";
-		data.message.badges.forEach(b => {
-			const badge = new Image(); badge.src = b.imageUrl; badge.classList.add("badge");
-			badgeListDiv.appendChild(badge);
-		});
+		RenderBadgeList(badgeListDiv, data.message.badges);
+		// Session cheer badge — last in the row, so Twitch's own badges keep their order.
+		const bitColor = BitTierColor(LookupTwitchBits(data.message.userId, data.message.username, data.message.displayName, data.user?.id));
+		if (bitColor) {
+			const gem = new Image(); gem.src = `icons/bit-${bitColor}.svg`;
+			gem.classList.add("badge", "bit-badge");
+			badgeListDiv.appendChild(gem);
+		}
 	}
 
 	data.emotes.forEach(e => {
@@ -1002,7 +1040,7 @@ async function renderFollowCard(data, platform, action = 'followed') {
 	const name = data.user?.name || 'Someone';
 
 	if (showUsername) {
-		usernameDiv.replaceWith(usernameMarquee(name, tameUsernameColor(await EventUserColor(data.user, platform))));
+		usernameDiv.replaceWith(usernameMarquee(name, usernameChatColor(await EventUserColor(data.user, platform))));
 	}
 
 	if (showPlatform && PLATFORMS_WITH_ICONS.has(platform)) {
@@ -1016,6 +1054,11 @@ async function renderFollowCard(data, platform, action = 'followed') {
 		avatarDiv.innerHTML = `<img src="${avatarURL}" class="avatar">`;
 	} else {
 		avatarDiv.style.display = 'none';
+	}
+
+	if (showBadges && platform === 'twitch') {
+		RenderBadgeList(instance.querySelector("#badgeList"),
+			LookupTwitchBadges(data.user?.id, data.user?.login, data.user?.name, data.user?.displayName));
 	}
 
 	if (showTimestamps) {
@@ -1035,6 +1078,11 @@ async function TwitchFollow(data) {
 
 // ===== Cheer / Bits (dedicated branded card) =====
 async function TwitchCheer(data) {
+	// Before the gate — the chat badge should still count up when cheer cards are off.
+	// ponytail: the cheerer's OWN cheer message shows the pre-cheer tier if Streamer.bot
+	// emits Twitch.ChatMessage before Twitch.Cheer; their next message is right. Counting
+	// the message's own cheerEmotes too would need a dedupe against this event's bits.
+	AddTwitchBits(data.bits, data.user?.id, data.user?.login, data.user?.name, data.user?.displayName);
 	if (!showTwitchCheers) return;
 	stingerTrigger('cheer', data);
 	const rawText = typeof data.message === 'string' ? data.message : (data.message?.message || '');
@@ -1050,13 +1098,7 @@ async function TwitchCheer(data) {
 
 	// Pick the bit gem color based on cheer amount (local bit-<color>.svg icons).
 	// Twitch tiers: 1-99 gray, 100-999 purple, 1000-4999 green, 5000-9999 blue, 10000+ red.
-	const bits = data.bits || 0;
-	let bitColor;
-	if      (bits >= 10000) bitColor = 'red';
-	else if (bits >= 5000)  bitColor = 'blue';
-	else if (bits >= 1000)  bitColor = 'green';
-	else if (bits >= 100)   bitColor = 'purple';
-	else                    bitColor = 'gray';
+	const bitColor = BitTierColor(data.bits || 0) || 'gray';
 
 	const bitIcon = `<img src="icons/bit-${bitColor}.svg" class="sub-bit-gem-icon">`;
 
@@ -1131,7 +1173,7 @@ async function TwitchRewardRedemption(data) {
 			const artUrl = songInfo.albumArt || 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
 
 			// Title / album / artist scroll (Apple-smooth wrap) instead of ellipsis-
-			// truncating, ported from collage.html's song-request card.
+			// truncating, ported from the Music-Info-Card song card.
 			htmlContent = `
 				<div class="music-ui-container">
 					<img class="music-ui-art" src="${artUrl}" onerror="this.style.display='none'" />
@@ -1293,18 +1335,6 @@ async function YouTubeSuperChat(data) {
 	if (!data.user) data.user = { id: data.eventId || 'yt-user', name: data.user ? data.user.name : 'YouTube Fan' };
 	await renderEventCard(data, 'superchat', 'youtube');
 }
-function YouTubeSuperSticker(data) {
-	if (!showYouTubeSuperStickers) return;
-	const template = document.getElementById('cardTemplate').content.cloneNode(true);
-	const cardDiv = template.querySelector("#card");
-	cardDiv.classList.add('youtube');
-	
-	const stickerInstance = document.getElementById('stickerTemplate').content.cloneNode(true);
-	stickerInstance.querySelector("#stickerImg").src = FindFirstImageUrl(data);
-	stickerInstance.querySelector("#stickerLabel").innerText = `${data.user.name} sent a Super Sticker (${data.amount})`;
-	template.querySelector("#content").appendChild(stickerInstance);
-	AddMessageItem(template, data.eventId, 'youtube', data.user.id);
-}
 async function YouTubeNewSponsor(data) {
 	if (!showYouTubeMemberships) return;
 	await renderFollowCard(data, 'youtube', 'subscribed');
@@ -1324,267 +1354,6 @@ async function StreamElementsTip(data) {
 	if (!data.user) data.user = { id: data.username, name: data.username };
 	if (!data.formattedAmount) data.formattedAmount = `$${data.amount}`;
 	await renderEventCard(data, 'donation', 'twitch');
-}
-
-// ============================================================
-//  Membership / donation platforms (branded via renderEventCard)
-// ============================================================
-
-function MoneyText(amount, currency) {
-	if (amount == null || Number(amount) === 0) return '';
-	return currency === 'USD' ? `$${amount}` : `${currency} ${amount}`;
-}
-
-// ----- Patreon -----
-function PatreonPledgeCreated(data) {
-	if (!showPatreon) return;
-	const amount = (data.attributes.will_pay_amount_cents / 100).toFixed(2);
-	renderEventCard({ ...data, user: { name: data.attributes.full_name } }, 'member', 'patreon', { description: `Joined Patreon ($${amount})` });
-}
-
-// ----- Ko-fi -----
-function KofiDonation(data) {
-	if (!showKofi) return;
-	renderEventCard({ ...data, user: { name: data.from } }, 'donation', 'kofi', { description: `Donated ${MoneyText(data.amount, data.currency)}` });
-}
-function KofiSubscription(data) {
-	if (!showKofi) return;
-	renderEventCard({ ...data, user: { name: data.from } }, 'member', 'kofi', { description: `Subscribed (${MoneyText(data.amount, data.currency)})` });
-}
-function KofiResubscription(data) {
-	if (!showKofi) return;
-	renderEventCard({ ...data, user: { name: data.from } }, 'member', 'kofi', { description: `Subscribed (${data.tier})` });
-}
-function KofiShopOrder(data) {
-	if (!showKofi) return;
-	const items = data.items ? data.items.length : 0;
-	const money = MoneyText(data.amount, data.currency);
-	renderEventCard({ ...data, user: { name: data.from } }, 'donation', 'kofi', { description: `Ordered ${items} item(s) on Ko-fi${money ? ` (${money})` : ''}` });
-}
-
-// ----- TipeeeStream -----
-function TipeeeStreamDonation(data) {
-	if (!showTipeeeStream) return;
-	renderEventCard({ ...data, user: { name: data.username } }, 'donation', 'tipeeeStream', { description: `Donated ${MoneyText(data.amount, data.currency)}` });
-}
-
-// ----- Fourthwall -----
-function FourthwallMoney(amount, currency) {
-	const m = MoneyText(amount, currency);
-	return m ? ` (${m})` : '';
-}
-function FourthwallOrderPlaced(data) {
-	if (!showFourthwall) return;
-	const item = data.variants?.[0]?.name || 'an item';
-	const extra = (data.variants?.length || 1) > 1 ? ` and ${data.variants.length - 1} other item(s)` : '';
-	renderEventCard({ ...data, user: { name: data.username || 'Someone' } }, 'donation', 'fourthwall', { description: `Ordered ${escapeHtml(item)}${extra}${FourthwallMoney(data.total, data.currency)}` });
-}
-function FourthwallDonation(data) {
-	if (!showFourthwall) return;
-	renderEventCard({ ...data, user: { name: data.username || 'Someone' } }, 'donation', 'fourthwall', { description: `Donated ${MoneyText(data.amount, data.currency)}` });
-}
-function FourthwallSubscriptionPurchased(data) {
-	if (!showFourthwall) return;
-	renderEventCard({ ...data, user: { name: data.nickname || 'Someone' } }, 'member', 'fourthwall', { description: `Subscribed${FourthwallMoney(data.amount, data.currency)}` });
-}
-function FourthwallGiftPurchase(data) {
-	if (!showFourthwall) return;
-	const gifts = data.gifts?.length || 1;
-	const itemName = data.offer?.name || 'an item';
-	const qty = gifts > 1 ? `${gifts} x ` : '';
-	renderEventCard({ ...data, user: { name: 'Someone' } }, 'donation', 'fourthwall', { description: `Gifted ${qty}${escapeHtml(itemName)}${FourthwallMoney(data.total, data.currency)}` });
-}
-function FourthwallGiftDrawStarted(data) {
-	if (!showFourthwall) return;
-	const itemName = data.offer?.name || 'a prize';
-	renderEventCard({ ...data, user: { name: 'Giveaway' }, text: `Type 'join' in the next ${data.durationSeconds} seconds for your chance to win!` }, 'donation', 'fourthwall', { description: `🎁 ${escapeHtml(itemName)} Giveaway!` });
-}
-function FourthwallGiftDrawEnded(data) {
-	if (!showFourthwall) return;
-	const winners = GetWinnersList(data.gifts);
-	renderEventCard({ ...data, user: { name: 'Giveaway' }, text: winners ? `Congratulations ${winners}!` : '' }, 'donation', 'fourthwall', { description: `🥳 Giveaway Ended 🥳` });
-}
-function GetWinnersList(gifts) {
-	if (!Array.isArray(gifts)) return '';
-	return gifts.map(g => g.winner?.username || g.username || g.nickname).filter(Boolean).join(', ');
-}
-
-// ============================================================
-//  Kick (chat via Streamer.bot; subs require Kick in Streamer.bot)
-// ============================================================
-
-// Render Kick inline emotes of the form [emote:id:name]
-function RenderKickEmotes(message) {
-	const emoteRegex = /\[emote:(\d+):([^\]]+)\]/g;
-	return message.replace(emoteRegex, (_, id, name) =>
-		`<img src="https://files.kick.com/emotes/${id}/fullsize" alt="${name}" title="${name}" class="emote" />`);
-}
-
-async function KickChatMessage(data) {
-	if (!showKickMessages) return;
-	if (data.text && data.text.startsWith("!") && excludeCommands) return;
-	if (ignoreUserList.includes((data.user.name || '').toLowerCase())) return;
-
-	const template = document.getElementById('messageTemplate');
-	const instance = template.content.cloneNode(true);
-
-	const replyDiv = instance.querySelector("#reply");
-	if (data.isReply && data.reply && showMessage) {
-		replyDiv.style.display = 'flex';
-		const replyUserDiv = instance.querySelector("#replyUser");
-		replyUserDiv.innerText = data.reply.userName;
-		replyUserDiv.style.color = usernameChatColor('#53FC18');
-		instance.querySelector("#replyMsg").innerText = data.reply.msgBody;
-	} else if (replyDiv) {
-		replyDiv.remove();
-	}
-
-	if (showTimestamps) instance.querySelector("#timestamp").innerText = GetCurrentTimeFormatted();
-
-	if (showUsername) {
-		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.replaceWith(usernameMarquee(data.user.name, usernameChatColor(data.user.color || '#53FC18')));
-	}
-
-	const messageDiv = instance.querySelector("#message");
-	if (showMessage) {
-		messageDiv.innerText = data.text || '';
-		messageDiv.innerHTML = RenderKickEmotes(messageDiv.innerHTML);
-		messageDiv.innerHTML = messageDiv.innerHTML.replace(/(^|\s)(@[^\s<]+)/g, `$1<span style="font-weight: bold; color: #53FC18;">$2</span>`);
-		messageDiv.innerHTML = linkify(messageDiv.innerHTML);
-	}
-
-	if (showPlatform) instance.querySelector("#platform").innerHTML = `<img src="icons/platforms/kick.png" class="platform"/>`;
-
-	if (showBadges) {
-		const badgeListDiv = instance.querySelector("#badgeList");
-		badgeListDiv.innerHTML = "";
-		(data.user.badges || []).forEach(b => {
-			if (b.imageUrl) {
-				const badge = new Image(); badge.src = b.imageUrl; badge.classList.add("badge");
-				badgeListDiv.appendChild(badge);
-			}
-		});
-	}
-
-	if (showAvatar) {
-		const avatarURL = await GetAvatar(data.user.name, data.user.profilePic || data.user.avatar || null, 'kick');
-		instance.querySelector("#avatar").innerHTML = `<img src="${avatarURL}" class="avatar">`;
-	}
-
-	AddMessageItem(instance, data.messageId, 'kick', data.user.id);
-}
-
-async function KickFollow(data) {
-	if (!showKickFollows) return;
-	const user = { id: data.user?.id, name: data.user?.name };
-	await renderFollowCard({ ...data, user }, 'kick');
-}
-
-async function KickSubscription(data) {
-	if (!showKickSubs) return;
-	const months = data.months || 1;
-	const desc = months > 1 ? `Resubscribed (${months} months)` : `Subscribed for the first time!`;
-	await renderEventCard({ ...data, user: { name: data.username } }, 'member', 'kick', { description: desc });
-}
-
-async function KickGiftedSubscriptions(data) {
-	if (!showKickSubs) return;
-	const count = data.gifted_usernames?.length || 0;
-	await renderEventCard({ ...data, user: { name: data.gifter_username } }, 'giftbomb', 'kick', { description: `Gifted ${count} subscription${count === 1 ? '' : 's'} to the community!` });
-}
-
-// ============================================================
-//  TikTok (via Tikfinity local websocket - opt-in)
-//  Enable with &enableTikTokSupport=true (requires Tikfinity running)
-// ============================================================
-
-const enableTikTokSupport = GetBooleanParam("enableTikTokSupport", false);
-let tikfinityWebsocket = null;
-
-function TikfinityConnect() {
-	if (!enableTikTokSupport) return;
-	if (tikfinityWebsocket) return;
-
-	tikfinityWebsocket = new WebSocket("ws://localhost:21213/");
-	tikfinityWebsocket.onopen = () => console.log("TikFinity connected");
-	tikfinityWebsocket.onclose = () => { tikfinityWebsocket = null; setTimeout(TikfinityConnect, 1000); };
-	tikfinityWebsocket.onerror = () => { tikfinityWebsocket = null; setTimeout(TikfinityConnect, 1000); };
-	tikfinityWebsocket.onmessage = (response) => {
-		const payload = JSON.parse(response.data);
-		switch (payload.event) {
-			case 'chat': TikTokChat(payload.data); break;
-			case 'follow': TikTokFollow(payload.data); break;
-			case 'gift': TikTokGift(payload.data); break;
-			case 'subscribe': TikTokSubscribe(payload.data); break;
-		}
-	};
-}
-window.addEventListener('load', TikfinityConnect);
-
-async function TikTokChat(data) {
-	if (!showTikTokChat) return;
-	if (data.comment && data.comment.startsWith("!") && excludeCommands) return;
-	if (ignoreUserList.includes((data.nickname || '').toLowerCase())) return;
-
-	const template = document.getElementById('messageTemplate');
-	const instance = template.content.cloneNode(true);
-
-	const replyDiv = instance.querySelector("#reply");
-	if (replyDiv) replyDiv.remove();
-
-	if (showTimestamps) instance.querySelector("#timestamp").innerText = GetCurrentTimeFormatted();
-
-	if (showUsername) {
-		const usernameDiv = instance.querySelector("#username");
-		usernameDiv.replaceWith(usernameMarquee(data.nickname, usernameChatColor('#FF0050')));
-	}
-
-	const messageDiv = instance.querySelector("#message");
-	if (showMessage) {
-		messageDiv.innerText = data.comment || '';
-		messageDiv.innerHTML = messageDiv.innerHTML.replace(/(^|\s)(@[^\s<]+)/g, `$1<span style="font-weight: bold; color: #FF0050;">$2</span>`);
-		messageDiv.innerHTML = linkify(messageDiv.innerHTML);
-	}
-
-	if (showPlatform) instance.querySelector("#platform").innerHTML = `<img src="icons/platforms/tiktok.png" class="platform"/>`;
-
-	if (showBadges) {
-		const badgeListDiv = instance.querySelector("#badgeList");
-		badgeListDiv.innerHTML = "";
-		(data.userBadges || []).forEach(b => {
-			if (b.type === 'image' && b.url) {
-				const badge = new Image(); badge.src = b.url; badge.classList.add("badge");
-				badgeListDiv.appendChild(badge);
-			}
-		});
-	}
-
-	if (showAvatar && data.profilePictureUrl) {
-		instance.querySelector("#avatar").innerHTML = `<img src="${data.profilePictureUrl}" class="avatar">`;
-	}
-
-	AddMessageItem(instance, data.msgId, 'tiktok', data.userId);
-}
-
-function TikTokFollow(data) {
-	if (!showTikTokFollows) return;
-	renderFollowCard({ ...data, user: { id: data.userId, name: data.nickname, profileImageUrl: data.profilePictureUrl } }, 'tiktok');
-}
-
-function TikTokSubscribe(data) {
-	if (!showTikTokSubs) return;
-	const months = data.subMonth;
-	const desc = months ? `Subscribed for ${months} month${months == 1 ? '' : 's'}` : `Subscribed on TikTok`;
-	renderEventCard({ ...data, user: { id: data.userId, name: data.nickname, profileImageUrl: data.profilePictureUrl } }, 'member', 'tiktok', { description: desc });
-}
-
-function TikTokGift(data) {
-	if (!showTikTokGifts) return;
-	// For streakable gifts, only render once the streak ends (avoids spam)
-	if (data.giftType === 1 && !data.repeatEnd) return;
-	const qty = data.repeatCount ? ` x${data.repeatCount}` : '';
-	renderEventCard({ ...data, user: { id: data.userId, name: data.nickname, profileImageUrl: data.profilePictureUrl } }, 'donation', 'tiktok', { description: `Sent ${escapeHtml(data.giftName || 'a gift')}${qty}` });
 }
 
 const Simplex3D = (function () {
@@ -1795,7 +1564,7 @@ function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 }
 
 /* ════════════════════════════════════════════════════════════════
-   Marquee driver — ported from Music-Info-Card/test/collage.html.
+   Marquee driver — ported from Videos/Music-Info-Card/MusicUIRender (app.js).
    Two modes share ONE velocity profile (ease-in → cruise → ease-out):
      smooth   — Apple wrap: two copies, rest at home, cruise once around, loop.
      fadeswap — cruise to the end, hold, fade out, reset home, fade back in.
@@ -1845,11 +1614,42 @@ function marqueeHTML(text, { mode = 'fadeswap', fade = true, cls = '' } = {}) {
 
 // A fade-scroll username marquee element, used everywhere a username used to
 // truncate with "…". Returns the .mq node ready to drop in place of a #username span.
+/* Outline ink for a username: its own colour taken right down, instead of flat black.
+   Keeping the hue means the antialiased edges blend toward a dark version of the name
+   rather than toward neutral, so the name reads as itself instead of as a greyed-out
+   version of itself. Accepts either form usernameChatColor can return (#rrggbb passed
+   through, or the rgb() a tamed colour becomes). */
+function usernameInk(color) {
+	if (typeof color !== 'string') return null;
+	let r, g, b;
+	const hex = color.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+	if (hex) {
+		let h = hex[1];
+		if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+		[r,g,b] = [0,2,4].map(i => parseInt(h.slice(i,i+2),16));
+	} else {
+		const m = color.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+		if (!m) return null;
+		[r,g,b] = [1,2,3].map(i => parseFloat(m[i]));
+	}
+	const k = USERNAME_INK_SCALE;
+	return `rgb(${Math.round(r*k)}, ${Math.round(g*k)}, ${Math.round(b*k)})`;
+}
+
 function usernameMarquee(text, color) {
 	const tpl = document.createElement('template');
 	tpl.innerHTML = marqueeHTML(text, { mode: 'fadeswap', fade: true, cls: 'name-mq' }).trim();
 	const mq = tpl.content.firstElementChild;
-	if (color) mq.style.color = color;
+	if (color) {
+		mq.style.color = color;
+		// Inherited by .mq-inner, where the text-shadow ring and the extrude both read
+		// var(--o-colour). Harmless on event cards, which carry no outline.
+		const ink = usernameInk(color);
+		if (ink) {
+			mq.style.setProperty('--o-colour', ink);
+			if (_oTextExtrudeTemplate) mq.style.setProperty('--o-text-extrude', _oTextExtrudeTemplate);
+		}
+	}
 	return mq;
 }
 
@@ -1961,7 +1761,7 @@ function mqEnsureRunning() {
 	requestAnimationFrame(mqLoop);
 }
 
-/* Gift-sub two-name width sharing (max-min fairness), ported from collage.html:
+/* Gift-sub two-name width sharing (max-min fairness), from the same marquee model:
      both fit        → each takes exactly what it needs (no scroll)
      one short/long  → short takes what it needs, long gets the rest
      both over half  → an even 50/50 split
@@ -2003,16 +1803,21 @@ function startCardMarquees(root) {
 	let maxDist = 0, hasFade = false;
 	wins.forEach(win => {
 		const m = { win, inner: win.querySelector('.mq-inner'), fade: win.classList.contains('fade'), mode: win.dataset.mqMode || 'park', group, O: 0, unit: 0 };
+		// clientWidth is the PADDING box, but the text is laid out from the CONTENT box,
+		// so a padded window (the outline needs one — see .contrast-outline .mq) has
+		// paddingLeft less room than clientWidth suggests. Without this the last few px
+		// of a long name never scroll into view.
+		const padL = parseFloat(getComputedStyle(win).paddingLeft) || 0;
 		if (m.mode === 'smooth') {
 			const copies = win.querySelectorAll('.mq-copy');
 			const copyW = copies[0] ? copies[0].offsetWidth : m.inner.scrollWidth;
-			m.O = Math.max(0, Math.round(copyW - win.clientWidth));
+			m.O = Math.max(0, Math.round(copyW - win.clientWidth + padL));
 			m.unit = copyW + MQ.smoothGap;
 			// only reveal the wrapped 2nd copy when the text actually overflows
 			if (copies[1]) copies[1].style.display = m.O > 0 ? '' : 'none';
 			if (m.O > 0) maxDist = Math.max(maxDist, m.unit);
 		} else {
-			m.O = Math.max(0, Math.round(m.inner.scrollWidth - win.clientWidth));
+			m.O = Math.max(0, Math.round(m.inner.scrollWidth - win.clientWidth + padL));
 			if (m.O > 0) { maxDist = Math.max(maxDist, m.O); if (m.mode === 'fadeswap') hasFade = true; }
 		}
 		mqActive.push(m);
@@ -2251,25 +2056,6 @@ function escapeHtml(text) {
 
 function linkify(text) {
 	return text.replace(/(\b(https?|ftp|file):\/\/[-A-Z0-9+&@#\/%?=~_|!:,.;]*[-A-Z0-9+&@#\/%=~_|])/ig, '<a href="$1" target="_blank">$1</a>');
-}
-
-function FindFirstImageUrl(jsonObject) {
-	function iterate(obj) {
-		if (Array.isArray(obj)) {
-			for (const item of obj) { const res = iterate(item); if (res) return res; }
-			return null;
-		}
-		for (const key in obj) {
-			if (obj.hasOwnProperty(key)) {
-				if (key === 'imageUrl') return obj[key];
-				if (typeof obj[key] === 'object' && obj[key] !== null) {
-					const res = iterate(obj[key]); if (res) return res;
-				}
-			}
-		}
-		return null;
-	}
-	return iterate(jsonObject);
 }
 
 function IsImageUrl(url) {
