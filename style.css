@@ -208,7 +208,7 @@ li {
 #username {
 	display: flex;
 	align-items: center;
-	font-weight: 600;
+	font-weight: 700;
 	font-size: 1em;
 	color: var(--twitch-purple); 
 	flex-shrink: 0;
@@ -221,7 +221,7 @@ li {
 #receiver-username {
 	display: flex;
 	align-items: center;
-	font-weight: 600;
+	font-weight: 700;
 	flex-shrink: 0;
 }
 
@@ -405,7 +405,7 @@ li.sub-card-li {
 	z-index: 1;
 	padding: 12px;
 	border-radius: 20px;
-	font-weight: 500;
+	font-weight: 600;
 	line-height: 1.2;
 	color: #000000;
 	min-height: 40px;
@@ -514,7 +514,7 @@ li.sub-card-li {
 }
 .follow-card-content #username {
 	display: block;
-	font-weight: 600;
+	font-weight: 700;
 	flex-shrink: 1;
 	min-width: 0;
 	overflow: hidden;
@@ -554,7 +554,7 @@ li.sub-card-li {
 
 .featured-message-text {
 	font-size: 1em;
-	font-weight: 500;
+	font-weight: 600;
 	line-height: 1.2;
 	color: #000000;
 	word-wrap: break-word;
@@ -905,8 +905,7 @@ a {
 
 /* Username fade-scroll window: replaces the old "…" ellipsis truncation. Shrinks
    within its flex row so it only scrolls when the name would overflow. */
-.name-mq { font-weight: 600; font-size: 1em; flex-shrink: 1; min-width: 0; }
-#messageContainer .name-mq { font-weight: 700; }
+.name-mq { font-weight: 700; font-size: 1em; flex-shrink: 1; min-width: 0; }
 
 /* ── Gift-sub two-name row (sender name ↔ receiver name share the width) ── */
 /* fill + 3px timestamp gap come from the base .sub-user-content rule above. */
@@ -923,7 +922,7 @@ a {
 }
 
 .gift-name {
-    font-weight: 600;
+    font-weight: 700;
     font-size: 1em;
     flex: 1 1 0;
     min-width: 0;
