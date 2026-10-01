@@ -6,14 +6,27 @@ const sbServerAddress = urlParams.get("address") || "127.0.0.1";
 const sbServerPort = urlParams.get("port") || "8080";
 
 const BASE_WIDTH = GetIntParam("width") || 502;
-const TARGET_WIDTH = GetIntParam("targetWidth") || (BASE_WIDTH === 502 ? 648 : BASE_WIDTH); 
-const scaleFactor = TARGET_WIDTH / BASE_WIDTH; 
+const TARGET_WIDTH_PARAM = GetIntParam("targetWidth");
 
 document.documentElement.style.setProperty('--width', `${BASE_WIDTH}px`);
 document.body.style.width = `${BASE_WIDTH}px`;
-document.body.style.height = `${100 / scaleFactor}vh`;
-document.body.style.transform = `scale(${scaleFactor})`;
-document.body.style.transformOrigin = "top left";
+// Scale with `zoom`, not transform: scale(). zoom lays the text out at its final pixel
+// size so it stays sharp; a transform rasterises small and stretches, which OBS shows
+// as pixelated. By default the chat fills the browser source's width, so set the size
+// in the source's Width/Height. For the smoothest edges, make the source 2x the size
+// you want and scale it to 0.5 in the scene (Bicubic/Lanczos), so OBS supersamples it.
+// Any extra `zoom` from OBS's custom CSS is folded in too.
+let cssZoom = 1;   // total zoom; also read by the canvas borders so they draw at screen size
+function FitToSource() {
+	const target = TARGET_WIDTH_PARAM || window.innerWidth || 648;
+	document.documentElement.style.zoom = target / BASE_WIDTH;
+	cssZoom = (parseFloat(getComputedStyle(document.documentElement).zoom) || 1) * (parseFloat(getComputedStyle(document.body).zoom) || 1);
+	document.body.style.height = `${window.innerHeight / cssZoom}px`;
+}
+FitToSource();
+window.addEventListener('load', FitToSource);
+window.addEventListener('resize', FitToSource);
+new MutationObserver(FitToSource).observe(document.head, { childList: true, subtree: true, characterData: true });
 
 const showPlatform = GetBooleanParam("showPlatform", true);
 const showAvatar = GetBooleanParam("showAvatar", true);
@@ -180,22 +193,20 @@ if (contrastOutline) {
 	const _oHr    = Math.max(0.5, OUTLINE.hrEm * _oFs);
 	const _oDepth = OUTLINE.depthEm * _oFs;
 
-	// N passes of exactly 1px, walking integer positions along the direction vector.
+	// N passes of exactly one screen pixel each along the direction vector. Built once at
+	// load, so a source resized while live needs a refresh to rebuild it.
 	function BuildExtrudeFilter(totalPx) {
-		const n = Math.round(totalPx);
+		// Step in whole SCREEN pixels. Under zoom a CSS 1px is 1.29+ screen px, so 1px CSS
+		// steps landed between pixels and the extrude edge came out choppy.
+		const unit = 1 / cssZoom, n = Math.round(totalPx * cssZoom);
 		if (n < 1) return 'none';
-		const tx = OUTLINE.dirX * totalPx, ty = OUTLINE.dirY * totalPx;
 		const out = [];
-		let px = 0, py = 0;
-		for (let k = 1; k <= n; k++) {
-			const qx = Math.round(tx * k / n), qy = Math.round(ty * k / n);
-			// var() rather than the literal: the colour is resolved on the element that
-			// uses the filter, so a username carrying its own --o-colour gets a 3D in
-			// its own ink while everything else falls back to the global one.
-			if (qx - px || qy - py) out.push(`drop-shadow(${qx - px}px ${qy - py}px 0 var(--o-colour, ${OUTLINE.colour}))`);
-			px = qx; py = qy;
-		}
-		return out.length ? out.join(' ') : 'none';
+		// var() rather than the literal: the colour is resolved on the element that
+		// uses the filter, so a username carrying its own --o-colour gets a 3D in
+		// its own ink while everything else falls back to the global one.
+		for (let k = 0; k < n; k++)
+			out.push(`drop-shadow(${(OUTLINE.dirX * unit).toFixed(4)}px ${(OUTLINE.dirY * unit).toFixed(4)}px 0 var(--o-colour, ${OUTLINE.colour}))`);
+		return out.join(' ');
 	}
 
 	const _oRoot = document.documentElement.style;
@@ -1502,8 +1513,10 @@ function initBoilingBorder(canvas, contentW, contentH, bottomExtension = 0) {
 	// buffer was released while off screen and the card comes back into view.
 	let sized = false;
 	function sizeCanvas() {
-		canvas.width = cw * dpr; canvas.height = ch * dpr;
-		ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(dpr, dpr);
+		// Draw at the size it ends up on screen (zoom), not 1x, or it's stretched and blurry.
+		const px = dpr * cssZoom;
+		canvas.width = Math.ceil(cw * px); canvas.height = Math.ceil(ch * px);
+		ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(px, px);
 		sized = true;
 	}
 	function releaseCanvas() {

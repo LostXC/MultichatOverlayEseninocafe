@@ -94,7 +94,7 @@ li {
 	box-shadow: none !important;
 	border-radius: 0 !important;
 	transition: height 0.5s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.4s ease-out;
-	will-change: height, opacity;
+	/* No will-change: a permanent layer hint keeps each line rasterised separately, which softens the text. */
 	width: var(--width);
 }
 
@@ -125,7 +125,7 @@ li {
    before showing it — exactly as it was. */
 .write-in .write-word {
 	display: inline-block;
-	animation: writeWordIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+	animation: writeWordIn 380ms cubic-bezier(0.22, 1, 0.36, 1) backwards;   /* backwards, not both: no transform left on the word once it lands */
 }
 @keyframes writeWordIn {
 	from { opacity: 0; transform: translateY(6px); }
@@ -693,23 +693,11 @@ a {
 .contrast-outline #messageContainer #timestamp,
 .contrast-outline #messageContainer .name-mq .mq-inner,
 .contrast-outline #messageContainer #replyUser {
-	text-shadow:
-		calc(var(--o-hr) * 1.000) calc(var(--o-hr) * 0.000) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.924) calc(var(--o-hr) * 0.383) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.707) calc(var(--o-hr) * 0.707) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.383) calc(var(--o-hr) * 0.924) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.000) calc(var(--o-hr) * 1.000) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.383) calc(var(--o-hr) * 0.924) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.707) calc(var(--o-hr) * 0.707) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.924) calc(var(--o-hr) * 0.383) 0 var(--o-colour),
-		calc(var(--o-hr) * -1.000) calc(var(--o-hr) * 0.000) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.924) calc(var(--o-hr) * -0.383) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.707) calc(var(--o-hr) * -0.707) 0 var(--o-colour),
-		calc(var(--o-hr) * -0.383) calc(var(--o-hr) * -0.924) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.000) calc(var(--o-hr) * -1.000) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.383) calc(var(--o-hr) * -0.924) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.707) calc(var(--o-hr) * -0.707) 0 var(--o-colour),
-		calc(var(--o-hr) * 0.924) calc(var(--o-hr) * -0.383) 0 var(--o-colour);
+	/* A real vector stroke rather than a ring of 16 hard text-shadows. The shadow ring
+	   lands on fractional pixels at 1x (OBS), which made the edges lumpy. paint-order
+	   keeps the stroke behind the fill, so it only grows outward (Chromium 123+). */
+	-webkit-text-stroke: calc(var(--o-hr) * 2) var(--o-colour);
+	paint-order: stroke fill;
 	filter: var(--o-text-extrude, none);
 }
 
@@ -927,3 +915,6 @@ a {
     flex: 1 1 0;
     min-width: 0;
 }
+/* Cards sit on solid white, so macOS would thicken their text while
+   chat (on transparency) can't be. Turn that off so card and chat text weigh the same. */
+.sub-event-container { -webkit-font-smoothing: antialiased; }
